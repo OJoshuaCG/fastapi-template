@@ -5,7 +5,6 @@ import time
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# from utils.context import current_http_identifier
 from app.utils.environments import (
     APP_NAME,
     LOGGER_LEVEL,
@@ -15,7 +14,7 @@ from app.utils.environments import (
 # Configuración del logger una sola vez
 logger = logging.getLogger(APP_NAME)
 logger.setLevel(LOGGER_LEVEL)
-logger.propagate = False  # Evita que se duplique en el logger raíz
+logger.propagate = False  # Evita que se duplique en el logger raiz
 
 if not logger.hasHandlers():
     console_handler = logging.StreamHandler()
@@ -28,7 +27,6 @@ class LoggerMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         unique_id = secrets.token_hex(8)
         request.session["request_id"] = unique_id
-        # current_http_identifier.set(unique_id)
         start_time = time.time()
 
         # Obtener datos de la solicitud
