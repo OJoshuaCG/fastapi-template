@@ -1,6 +1,8 @@
-def main():
-    print("Hello from fastapi-template!")
+from fastapi import FastAPI
+
+app = FastAPI()
 
 
-if __name__ == "__main__":
-    main()
+@app.get("/test/ping", tags=["test"])
+async def ping():
+    return {"message": "pong!"}
