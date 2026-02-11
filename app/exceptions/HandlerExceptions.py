@@ -8,10 +8,10 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from app.core.context import current_http_identifier
-from app.core.environments import APP_ENV, LOGGER_EXCEPTIONS, ROOT_DIR
+from app.core.environments import APP_ENV, LOGGER_EXCEPTIONS_ENABLED, ROOT_DIR
 from app.exceptions import AppHttpException
 
-if LOGGER_EXCEPTIONS:
+if LOGGER_EXCEPTIONS_ENABLED:
     logger = logging.getLogger("API Omnicanal")
     logger.setLevel("WARNING")
     logger.propagate = False
@@ -29,7 +29,7 @@ async def app_exception_handler(request: Request, exc: AppHttpException):
         "type": exc.__class__.__name__,
     }
 
-    if LOGGER_EXCEPTIONS:
+    if LOGGER_EXCEPTIONS_ENABLED:
         logger_warning_exception = [
             current_http_identifier.get(),
             f"Exception: {exc.__class__.__name__}",
@@ -62,7 +62,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
         }
         detail_error["loc"] = trace_info["origin"]
 
-    if LOGGER_EXCEPTIONS:
+    if LOGGER_EXCEPTIONS_ENABLED:
         logger_warning_exception_params = [
             current_http_identifier.get(),
             f"Exception: {exc.__class__.__name__}",

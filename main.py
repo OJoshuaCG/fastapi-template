@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from app.core.environments import LOGGER_MIDDLEWARE_ENABLED
 from app.exceptions import (
     AppHttpException,
     app_exception_handler,
@@ -12,7 +13,8 @@ from app.routes.routes import router as routes_router
 app = FastAPI()
 
 # === Middlewares
-app.add_middleware(LoggerMiddleware)
+if LOGGER_MIDDLEWARE_ENABLED:
+    app.add_middleware(LoggerMiddleware)
 app.add_middleware(ContextMiddleware)
 
 # === Exceptions
