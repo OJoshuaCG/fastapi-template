@@ -3,22 +3,30 @@ from contextlib import contextmanager
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from app.core.environments import DB_ENGINE, DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions.AppHttpException import AppHttpException
 from app.utils import dict_utils
 
 
 class Database:
     def __init__(
-        self, db_name: str, db_user: str, db_pass: str, db_host: str, db_port: int
+        self, 
+        db_name: str=DB_NAME,
+        db_user: str=DB_USER,
+        db_pass: str=DB_PASS,
+        db_host: str=DB_HOST,
+        db_port: int=DB_PORT,
+        db_engine: str=DB_ENGINE
     ):
         self.__db_name: str = db_name
         self.__db_user: str = db_user
         self.__db_pass: str = db_pass
         self.__db_host: str = db_host
         self.__db_port: str = db_port
+        self.__db_engine: str = db_engine
 
         # DB_URL = f"mysql+pymysql://{self.__db_name}:{self.__db_pass}@{self.__db_host}:{self.__db_port}/{self.__db_name}"
-        DB_URL = f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+        DB_URL = f"{self.__db_engine}://{self.__db_user}:{self.__db_pass}@{self.__db_host}:{self.__db_port}/{self.__db_name}"
 
         self.engine = create_engine(
             DB_URL,
