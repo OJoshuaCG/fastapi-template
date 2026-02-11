@@ -73,7 +73,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        compare_type=True,            # Detecta cambios en tipos de datos
+        compare_type=True,  # Detecta cambios en tipos de datos
         compare_server_default=True,  # Detecta cambios en valores default
     )
 
@@ -98,7 +98,7 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
         connect_args={
             "charset": "utf8mb4",
-            "init_command": "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci"
+            "init_command": "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
         },
     )
 
@@ -106,7 +106,7 @@ def run_migrations_online() -> None:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            compare_type=True,            # Detecta cambios en tipos de datos
+            compare_type=True,  # Detecta cambios en tipos de datos
             compare_server_default=True,  # Detecta cambios en valores default
         )
 

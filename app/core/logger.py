@@ -3,7 +3,9 @@ import logging
 from app.core.environments import APP_NAME, LOGGER_LEVEL
 
 
-def get_logger(name: str | None = None, level: str | int | None = None) -> logging.Logger:
+def get_logger(
+    name: str | None = None, level: str | int | None = None
+) -> logging.Logger:
     """
     Obtiene o crea un logger configurado con las opciones del proyecto.
 

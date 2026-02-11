@@ -16,9 +16,15 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 
 # ======= Logger variables ======= #
 LOGGER_LEVEL = os.getenv("LOGGER_LEVEL", "INFO")
-LOGGER_MIDDLEWARE_ENABLED = os.getenv("LOGGER_MIDDLEWARE_ENABLED", "True").lower() == "true"
-LOGGER_MIDDLEWARE_SHOW_HEADERS = os.getenv("LOGGER_MIDDLEWARE_SHOW_HEADERS", "False").lower() == "true"
-LOGGER_EXCEPTIONS_ENABLED = os.getenv("LOGGER_EXCEPTIONS_ENABLED", "False").lower() == "true"
+LOGGER_MIDDLEWARE_ENABLED = (
+    os.getenv("LOGGER_MIDDLEWARE_ENABLED", "True").lower() == "true"
+)
+LOGGER_MIDDLEWARE_SHOW_HEADERS = (
+    os.getenv("LOGGER_MIDDLEWARE_SHOW_HEADERS", "False").lower() == "true"
+)
+LOGGER_EXCEPTIONS_ENABLED = (
+    os.getenv("LOGGER_EXCEPTIONS_ENABLED", "False").lower() == "true"
+)
 
 
 # ======= Database variables ======= #

@@ -22,14 +22,13 @@ class User(Base, TimestampMixin):
     Representa un usuario con autenticación, permisos y perfil básico.
     Hereda timestamps automáticos (created_at, updated_at) del TimestampMixin.
     """
+
     __tablename__ = "users"
     __table_args__ = {"comment": "Tabla de usuarios del sistema"}
 
     # Primary Key
     id: Mapped[int] = mapped_column(
-        primary_key=True,
-        autoincrement=True,
-        comment="ID único del usuario"
+        primary_key=True, autoincrement=True, comment="ID único del usuario"
     )
 
     # Campos únicos con índices
@@ -38,7 +37,7 @@ class User(Base, TimestampMixin):
         unique=True,
         index=True,
         nullable=False,
-        comment="Nombre de usuario único para login"
+        comment="Nombre de usuario único para login",
     )
 
     email: Mapped[str] = mapped_column(
@@ -46,27 +45,21 @@ class User(Base, TimestampMixin):
         unique=True,
         index=True,
         nullable=False,
-        comment="Correo electrónico único del usuario"
+        comment="Correo electrónico único del usuario",
     )
 
     # Autenticación
     hashed_password: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-        comment="Contraseña hasheada (bcrypt/argon2)"
+        String(255), nullable=False, comment="Contraseña hasheada (bcrypt/argon2)"
     )
 
     # Información de perfil
     full_name: Mapped[str | None] = mapped_column(
-        String(100),
-        nullable=True,
-        comment="Nombre completo del usuario"
+        String(100), nullable=True, comment="Nombre completo del usuario"
     )
 
     notes: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-        comment="Notas adicionales sobre el usuario"
+        Text, nullable=True, comment="Notas adicionales sobre el usuario"
     )
 
     # Permisos y estado
@@ -75,7 +68,7 @@ class User(Base, TimestampMixin):
         default=True,
         server_default="1",
         nullable=False,
-        comment="Indica si el usuario está activo en el sistema"
+        comment="Indica si el usuario está activo en el sistema",
     )
 
     is_superuser: Mapped[bool] = mapped_column(
@@ -83,7 +76,7 @@ class User(Base, TimestampMixin):
         default=False,
         server_default="0",
         nullable=False,
-        comment="Indica si el usuario tiene privilegios de superusuario"
+        comment="Indica si el usuario tiene privilegios de superusuario",
     )
 
     def __repr__(self) -> str:

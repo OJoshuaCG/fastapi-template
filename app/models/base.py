@@ -6,7 +6,6 @@ Establece naming conventions para constraints y provee funcionalidad común.
 """
 
 from datetime import datetime
-from typing import Any
 
 from sqlalchemy import MetaData, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -29,6 +28,7 @@ class Base(DeclarativeBase):
     Todos los modelos deben heredar de esta clase para ser detectados
     por Alembic y poder usar el sistema de migraciones.
     """
+
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
@@ -45,14 +45,15 @@ class TimestampMixin:
             __tablename__ = "my_table"
             id: Mapped[int] = mapped_column(primary_key=True)
     """
+
     created_at: Mapped[datetime] = mapped_column(
         server_default=func.now(),
         nullable=False,
-        comment="Fecha y hora de creación del registro"
+        comment="Fecha y hora de creación del registro",
     )
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
-        comment="Fecha y hora de última actualización del registro"
+        comment="Fecha y hora de última actualización del registro",
     )
