@@ -1,26 +1,14 @@
-import logging
 import time
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.context import current_http_identifier
-from app.core.environments import (
-    APP_NAME,
-    LOGGER_LEVEL,
-    LOGGER_MIDDLEWARE_SHOW_HEADERS,
-)
+from app.core.environments import LOGGER_MIDDLEWARE_SHOW_HEADERS
+from app.core.logger import get_logger
 
-# Configuración del logger una sola vez
-logger = logging.getLogger(APP_NAME)
-logger.setLevel(LOGGER_LEVEL)
-logger.propagate = False  # Evita que se duplique en el logger raiz
-
-if not logger.hasHandlers():
-    console_handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+# Configuración del logger usando la función centralizada
+logger = get_logger()
 
 
 class LoggerMiddleware(BaseHTTPMiddleware):

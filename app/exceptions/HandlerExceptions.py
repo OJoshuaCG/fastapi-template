@@ -1,4 +1,3 @@
-import logging
 import sys
 import traceback
 from pathlib import Path
@@ -9,18 +8,11 @@ from fastapi.responses import JSONResponse
 
 from app.core.context import current_http_identifier
 from app.core.environments import APP_ENV, LOGGER_EXCEPTIONS_ENABLED, ROOT_DIR
+from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 
 if LOGGER_EXCEPTIONS_ENABLED:
-    logger = logging.getLogger("API Omnicanal")
-    logger.setLevel("WARNING")
-    logger.propagate = False
-
-    if not logger.hasHandlers():
-        console_handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+    logger = get_logger(level="WARNING")
 
 
 async def app_exception_handler(request: Request, exc: AppHttpException):
