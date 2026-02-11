@@ -36,6 +36,28 @@ class Database:
             self.engine.dispose()
 
 
+    def get_declarative_base_session(self):
+        """
+        Retorna sesión para uso con modelos ORM SQLAlchemy.
+
+        Permite coexistencia de SQL directo (execute_query) y ORM.
+        La sesión debe cerrarse manualmente después de su uso.
+
+        Uso:
+            from app.models import User
+            session = db.get_declarative_base_session()
+            try:
+                user = session.query(User).filter(User.id == 1).first()
+                session.commit()
+            finally:
+                session.close()
+
+        Returns:
+            Session: Sesión SQLAlchemy para operaciones ORM
+        """
+        return self.SessionLocal()
+
+
     def execute_query(self, query, params:dict={}, fetchone:bool|None=None, commit:bool|None=False):
         with self.get_session() as session:
             try:
