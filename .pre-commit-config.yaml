@@ -44,8 +44,8 @@ repos:
     hooks:
       - id: detect-secrets
         name: Detect secrets
-        args: ['.secrets.baseline']
-        exclude: package.lock.json|uv.lock
+        args: ['scan', '--baseline', '.secrets.baseline']
+        exclude: package.lock.json|uv.lock|.pre-commit-config.yaml
 
   # Bandit: Security linter for Python
   - repo: https://github.com/PyCQA/bandit
