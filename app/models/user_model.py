@@ -29,9 +29,7 @@ class UserModel:
             dict | None: Datos del usuario o None si no existe
         """
         return self.db.execute_query(
-            "SELECT * FROM users WHERE id = :id",
-            {"id": user_id},
-            fetchone=True
+            "SELECT * FROM users WHERE id = :id", {"id": user_id}, fetchone=True
         )
 
     def find_by_username(self, username: str) -> dict | None:
@@ -47,7 +45,7 @@ class UserModel:
         return self.db.execute_query(
             "SELECT * FROM users WHERE username = :username",
             {"username": username},
-            fetchone=True
+            fetchone=True,
         )
 
     def find_by_email(self, email: str) -> dict | None:
@@ -61,9 +59,7 @@ class UserModel:
             dict | None: Datos del usuario o None si no existe
         """
         return self.db.execute_query(
-            "SELECT * FROM users WHERE email = :email",
-            {"email": email},
-            fetchone=True
+            "SELECT * FROM users WHERE email = :email", {"email": email}, fetchone=True
         )
 
     def find_all(self, is_active: bool | None = None) -> list[dict]:

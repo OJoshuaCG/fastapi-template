@@ -36,7 +36,7 @@ class UserController:
             raise AppHttpException(
                 message="Usuario no encontrado",
                 status_code=404,
-                context={"user_id": user_id}
+                context={"user_id": user_id},
             )
 
         return user
@@ -60,7 +60,7 @@ class UserController:
             raise AppHttpException(
                 message="Usuario no encontrado",
                 status_code=404,
-                context={"username": username}
+                context={"username": username},
             )
 
         return user
@@ -97,7 +97,7 @@ class UserController:
             raise AppHttpException(
                 message="El username ya está en uso",
                 status_code=409,
-                context={"username": user_data["username"]}
+                context={"username": user_data["username"]},
             )
 
         # Validar email único
@@ -106,7 +106,7 @@ class UserController:
             raise AppHttpException(
                 message="El email ya está en uso",
                 status_code=409,
-                context={"email": user_data.get("email")}
+                context={"email": user_data.get("email")},
             )
 
         # Crear usuario
@@ -131,7 +131,7 @@ class UserController:
             AppHttpException: Si el email ya está en uso (409)
         """
         # Validar que el usuario existe
-        user = self.get_user(user_id)
+        self.get_user(user_id)
 
         # Si se actualiza email, validar que no esté en uso
         if "email" in user_data:
@@ -140,7 +140,7 @@ class UserController:
                 raise AppHttpException(
                     message="El email ya está en uso",
                     status_code=409,
-                    context={"email": user_data["email"]}
+                    context={"email": user_data["email"]},
                 )
 
         # Actualizar usuario

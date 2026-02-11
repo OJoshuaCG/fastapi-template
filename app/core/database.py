@@ -10,13 +10,13 @@ from app.utils import dict_utils
 
 class Database:
     def __init__(
-        self, 
-        db_name: str=DB_NAME,
-        db_user: str=DB_USER,
-        db_pass: str=DB_PASS,
-        db_host: str=DB_HOST,
-        db_port: int=DB_PORT,
-        db_engine: str=DB_ENGINE
+        self,
+        db_name: str = DB_NAME,
+        db_user: str = DB_USER,
+        db_pass: str = DB_PASS,
+        db_host: str = DB_HOST,
+        db_port: int = DB_PORT,
+        db_engine: str = DB_ENGINE,
     ):
         self.__db_name: str = db_name
         self.__db_user: str = db_user
