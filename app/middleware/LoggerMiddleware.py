@@ -5,7 +5,8 @@ import time
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.utils.environments import (
+from app.core.context import current_http_identifier
+from app.core.environments import (
     APP_NAME,
     LOGGER_LEVEL,
     LOGGER_MIDDLEWARE_SHOW_HEADERS,
@@ -25,8 +26,7 @@ if not logger.hasHandlers():
 
 class LoggerMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        unique_id = secrets.token_hex(8)
-        request.session["request_id"] = unique_id
+        unique_id = current_http_identifier.get()
         start_time = time.time()
 
         # Obtener datos de la solicitud

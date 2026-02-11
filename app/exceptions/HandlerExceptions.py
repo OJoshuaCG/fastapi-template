@@ -7,9 +7,9 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-# from utils.context import current_http_identifier
+from app.core.context import current_http_identifier
+from app.core.environments import APP_ENV, LOGGER_EXCEPTIONS, ROOT_DIR
 from app.exceptions import AppHttpException
-from app.utils.environments import APP_ENV, LOGGER_EXCEPTIONS, ROOT_DIR
 
 if LOGGER_EXCEPTIONS:
     logger = logging.getLogger("API Omnicanal")
@@ -31,7 +31,7 @@ async def app_exception_handler(request: Request, exc: AppHttpException):
 
     if LOGGER_EXCEPTIONS:
         logger_warning_exception = [
-            request.session["request_id"],
+            current_http_identifier.get(),
             f"Exception: {exc.__class__.__name__}",
             f"Message: {exc.message}",
             f"Status Code: {exc.status_code}",
@@ -64,7 +64,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
     if LOGGER_EXCEPTIONS:
         logger_warning_exception_params = [
-            request.session["request_id"],
+            current_http_identifier.get(),
             f"Exception: {exc.__class__.__name__}",
             f'Message: UNHANDLED EXC. "{str(exc)}"',
             f"File: {trace_info['origin']['file']}",

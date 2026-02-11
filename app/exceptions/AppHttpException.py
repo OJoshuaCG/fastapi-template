@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from app.utils.environments import ROOT_DIR
+from app.core.environments import ROOT_DIR
 
 
 class AppHttpException(HTTPException):
