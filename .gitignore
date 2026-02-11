@@ -21,6 +21,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.ruff_cache/
 
 # === Virtual Environments (uv, venv, virtualenv) ===
 .venv/
@@ -71,3 +72,5 @@ dmypy.json
 # === OS Generated ===
 .DS_Store
 Thumbs.db
+
+.secrets.baseline
