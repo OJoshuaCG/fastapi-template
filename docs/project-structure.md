@@ -26,7 +26,6 @@ fastapi-template/
 │   └── development/              # Docs de desarrollo
 ├── main.py                       # Punto de entrada FastAPI
 ├── pyproject.toml                # Dependencias y configuración
-├── .pre-commit-config.yaml       # Configuración de pre-commit
 ├── .env.example                  # Template de variables de entorno
 ├── .env                          # Variables de entorno (no versionado)
 ├── .gitignore                    # Archivos ignorados por git
@@ -458,7 +457,6 @@ docs/
 │   ├── exceptions.md            # Manejo de errores
 │   └── middlewares.md           # Middlewares
 └── development/
-    ├── pre-commit.md            # Pre-commit hooks
     └── best-practices.md        # Mejores prácticas
 ```
 
@@ -512,9 +510,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = [
-    "pre-commit>=4.5.1",
-]
+dev = []
 ```
 
 **Agregar dependencias:**
@@ -525,18 +521,6 @@ uv add <paquete>
 # Desarrollo
 uv add --group dev <paquete>
 ```
-
-### `.pre-commit-config.yaml` - Pre-commit Hooks
-
-**Propósito**: Configuración de hooks que se ejecutan antes de cada commit.
-
-**Hooks configurados:**
-- **Ruff**: Linter y formateador
-- **Bandit**: Análisis de seguridad
-- **detect-secrets**: Prevención de commits de credenciales
-- **Checks estándar**: YAML, TOML, JSON, trailing whitespace, etc.
-
-**Ver más**: [docs/development/pre-commit.md](development/pre-commit.md)
 
 ### `.env.example` - Template de Variables
 
@@ -761,8 +745,6 @@ alembic/env.py
 4. **Acceder variables de entorno solo desde `app.core.environments`**
 5. **Mantener middlewares en orden correcto** (Context → Logger)
 6. **Documentar nuevas features** en `docs/`
-7. **Ejecutar pre-commit** antes de cada commit
-
 ## Recursos
 
 - [Guía de Inicio Rápido](getting-started.md)

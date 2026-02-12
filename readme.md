@@ -12,7 +12,6 @@ Esta plantilla proporciona una base sólida para desarrollar aplicaciones FastAP
 - **Base de Datos**: Soporte para SQL directo y ORM con SQLAlchemy 2.0
 - **Migraciones**: Alembic configurado y listo para usar
 - **Manejo de Errores**: Sistema robusto de excepciones con tracking automático
-- **Pre-commit Hooks**: Ruff, Bandit, detect-secrets y más
 - **Trazabilidad**: Request ID único en cada petición para debugging
 - **Producción Ready**: Configuración para desarrollo y producción
 
@@ -65,8 +64,6 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Instalar dependencias del proyecto
 uv sync
 
-# Instalar pre-commit hooks
-uv run pre-commit install
 ```
 
 ### 4. Configurar Base de Datos
@@ -120,7 +117,6 @@ fastapi-template/
 ├── docs/                  # Documentación del proyecto
 ├── main.py                # Punto de entrada de la aplicación
 ├── pyproject.toml         # Configuración de dependencias
-├── .pre-commit-config.yaml # Configuración de pre-commit
 └── .env.example           # Ejemplo de variables de entorno
 ```
 
@@ -144,7 +140,6 @@ Ver más detalles en [Estructura del Proyecto](docs/project-structure.md).
 
 ### Desarrollo
 
-- [Pre-commit Hooks](docs/development/pre-commit.md) - Configuración de calidad de código
 - [Mejores Prácticas](docs/development/best-practices.md) - Guía de desarrollo
 - [Despliegue](docs/deployment.md) - Guía de producción
 
@@ -206,25 +201,6 @@ Ver [README_MIGRATIONS.md](README_MIGRATIONS.md) para:
 - Troubleshooting
 - Integración con SQL directo
 - Comandos avanzados
-
-## Pre-commit Hooks
-
-El proyecto incluye hooks automáticos de pre-commit para mantener calidad de código:
-
-- **Ruff**: Linter y formateador (reemplaza flake8, isort, black)
-- **Bandit**: Análisis de seguridad
-- **detect-secrets**: Prevención de commits de credenciales
-- **Validadores**: YAML, TOML, JSON, trailing whitespace, etc.
-
-```bash
-# Instalar hooks (solo una vez)
-uv run pre-commit install
-
-# Ejecutar manualmente en todos los archivos
-uv run pre-commit run --all-files
-```
-
-Ver [Pre-commit Hooks](docs/development/pre-commit.md) para más detalles.
 
 ## Ejemplos de Uso
 
@@ -317,8 +293,6 @@ raise AppHttpException(
 - **[Pydantic](https://docs.pydantic.dev/)** - Validación de datos
 - **[Ruff](https://docs.astral.sh/ruff/)** - Linter y formateador extremadamente rápido
 - **[Bandit](https://bandit.readthedocs.io/)** - Herramienta de seguridad para Python
-- **[Pre-commit](https://pre-commit.com/)** - Framework de git hooks
-
 ## Requisitos
 
 - Python 3.13+

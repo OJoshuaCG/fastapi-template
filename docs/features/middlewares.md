@@ -449,4 +449,4 @@ class DebugMiddleware(BaseHTTPMiddleware):
 
 ---
 
-**Siguiente**: [Pre-commit Hooks](../development/pre-commit.md)
+**Siguiente**: [Mejores Prácticas](../development/best-practices.md)

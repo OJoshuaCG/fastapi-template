@@ -48,7 +48,6 @@ fastapi-template/
 │   └── development/        # Guías de desarrollo
 ├── main.py                 # Punto de entrada de FastAPI
 ├── pyproject.toml          # Dependencias y configuración del proyecto
-├── .pre-commit-config.yaml # Configuración de hooks de pre-commit
 ├── .env.example            # Template de variables de entorno
 └── .gitignore              # Archivos ignorados por git
 ```
@@ -384,26 +383,6 @@ logger.info(f"{request_id} | Usuario {user_id} creado exitosamente")
 - **SIEMPRE** usar `app.core.environments`
 - **Documentar** nuevas variables en `.env.example`
 
-## Pre-commit Hooks
-
-El proyecto usa pre-commit para mantener calidad de código.
-
-**Hooks configurados:**
-- **Ruff**: Linter + formateador (reemplaza flake8, isort, black, pyupgrade)
-- **Bandit**: Análisis de seguridad
-- **detect-secrets**: Prevención de commits de credenciales
-- **Checks estándar**: trailing whitespace, EOF, YAML/TOML/JSON syntax, merge conflicts
-
-**Ejecutar manualmente:**
-```bash
-uv run pre-commit run --all-files
-```
-
-**Si un hook falla:**
-1. Revisar los cambios automáticos (Ruff puede auto-fix)
-2. Corregir manualmente si es necesario
-3. Re-stage y commit
-
 ## Tecnologías Clave
 
 - **FastAPI**: Framework web con validación automática y documentación
@@ -447,10 +426,6 @@ uv run pre-commit run --all-files
 # Desarrollo
 uv run uvicorn main:app --reload
 uv run uvicorn main:app --reload --host 0.0.0.0 --port 8080
-
-# Pre-commit
-uv run pre-commit install
-uv run pre-commit run --all-files
 
 # Migraciones
 uv run alembic revision --autogenerate -m "descripción"

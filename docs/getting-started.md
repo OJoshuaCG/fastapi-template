@@ -98,8 +98,6 @@ Copia el resultado y pégalo en `SECRET_KEY` de tu `.env`.
 # Instalar todas las dependencias del proyecto
 uv sync
 
-# Instalar pre-commit hooks
-uv run pre-commit install
 ```
 
 **Nota**: `uv sync` crea automáticamente un entorno virtual en `.venv/` e instala todas las dependencias de `pyproject.toml`.
@@ -268,16 +266,6 @@ uv run alembic history
 
 Ver guía completa en [README_MIGRATIONS.md](../README_MIGRATIONS.md).
 
-### Pre-commit
-
-```bash
-# Ejecutar en todos los archivos
-uv run pre-commit run --all-files
-
-# Actualizar hooks
-uv run pre-commit autoupdate
-```
-
 ### Uvicorn
 
 ```bash
@@ -333,16 +321,6 @@ uv run alembic stamp head
 # Luego aplicar migraciones
 uv run alembic upgrade head
 ```
-
-### Error: Pre-commit hooks fallan
-
-**Problema**: Código no cumple con estándares de Ruff o Bandit.
-
-**Solución**:
-1. Revisar salida del error
-2. Corregir automáticamente con: `uv run pre-commit run --all-files`
-3. Corregir manualmente si es necesario
-4. Re-stage y commit
 
 ### Puerto 8000 en uso
 
