@@ -1,101 +1,81 @@
-# Formato Estándar de Respuestas
+# Formato de Respuestas
 
-## El Envelope `ApiResponse[T]`
+Las respuestas exitosas usan el envelope `ApiResponse[T]` (`app/utils/response.py`). Los errores usan otro formato (`{"detail": {...}}`), que generan los exception handlers. Ver [Manejo de Excepciones](exceptions.md).
 
-Todas las respuestas exitosas usan el mismo envelope. Los campos `None` se excluyen automáticamente del JSON.
+## `ApiResponse[T]`
 
 ```python
-class ApiResponse(BaseModel, Generic[T]):
-    data: T | None = None           # Payload principal
-    message: str | None = None      # Mensaje para el usuario final
-    pagination: PaginationMeta | None = None  # Solo en respuestas paginadas
+class ApiResponse[T](BaseModel):
+    data: T | None = Field(default=None, exclude_if=_is_none)
+    message: str | None = Field(default=None, exclude_if=_is_none)
+    pagination: PaginationMeta | None = Field(default=None, exclude_if=_is_none)
 ```
 
-## Los 3 Helpers
+Solo los campos de **primer nivel** con valor `None` se excluyen del JSON (`Field(exclude_if=...)`). No hace falta `response_model_exclude_none=True`. Los `None` **dentro** de `data` se conservan (ej. `"full_name": null`). El esquema OpenAPI conserva `data`, `message` y `pagination` tipados, así que los clientes generados tienen tipos.
 
-### `success(data, message?)` — Respuesta con datos
+## Helpers
 
-```python
-from app.utils.response import success, ApiResponse
+| Helper | Uso | Salida |
+|---|---|---|
+| `success(data=..., message=None)` | GET/POST/PATCH con datos | `{"data": {...}}` / `{"data": {...}, "message": "..."}` |
+| `paginated(items, total=..., pagination=..., message=None)` | listas paginadas | `{"data": [...], "pagination": {...}}` |
+| `empty(message=None)` | DELETE, acciones void | `{"message": "..."}` / `{}` |
 
-@router.get("/{id}", response_model=ApiResponse[UserOut])
-async def get_user(id: int):
-    user = controller.get_user(id)
-    return success(data=user)
-    # → {"data": {"id": 1, "name": "John"}}
-
-    return success(data=user, message="Usuario encontrado")
-    # → {"data": {"id": 1, "name": "John"}, "message": "Usuario encontrado"}
-```
-
-### `paginated(data, total, pagination, message?)` — Lista paginada
+## Ejemplos
 
 ```python
-from app.utils.response import paginated, ApiResponse
+from fastapi import status
+
+from app.controllers.user_controller import UserControllerDep
+from app.schemas.user import UserCreate, UserOut
 from app.utils.pagination import PaginationDep
+from app.utils.response import ApiResponse, empty, paginated, success
 
-@router.get("/", response_model=ApiResponse[list[UserOut]])
-async def list_users(pagination: PaginationDep):
-    users = model.find_all(limit=pagination.size, offset=pagination.offset)
-    total = model.count()
-    return paginated(users, total=total, pagination=pagination)
+
+@router.get("/{user_id}", response_model=ApiResponse[UserOut])
+async def get_user(user_id: int, users: UserControllerDep):
+    return success(data=await users.get_user(user_id))
+
+
+@router.post("", response_model=ApiResponse[UserOut], status_code=status.HTTP_201_CREATED)
+async def create_user(payload: UserCreate, users: UserControllerDep):
+    ...
+    return success(data=created, message="Usuario creado exitosamente")
+
+
+@router.get("", response_model=ApiResponse[list[UserOut]])
+async def list_users(pagination: PaginationDep, users: UserControllerDep):
+    items, total = await users.list_users(pagination)
+    return paginated(items, total=total, pagination=pagination)
+
+
+@router.delete("/{user_id}", response_model=ApiResponse[None])
+async def delete_user(user_id: int, users: UserControllerDep):
+    await users.delete_user(user_id)
+    return empty("Usuario eliminado exitosamente")
 ```
 
-Respuesta:
-```json
-{
-  "data": [{"id": 1}, {"id": 2}],
-  "pagination": {
-    "page": 1,
-    "size": 20,
-    "total": 150,
-    "pages": 8,
-    "has_next": true,
-    "has_prev": false
-  }
-}
-```
+## `response_model` como filtro
 
-### `empty(message?)` — Sin contenido (DELETE, acciones void)
+Declara siempre `response_model=ApiResponse[TuSchemaOut]`. Además de documentar en OpenAPI, FastAPI **filtra** la salida al schema: si el dict del model trae columnas extra, no llegan al cliente.
+
+Aun así, no selecciones columnas sensibles en consultas que terminan en una respuesta. `UserModel` usa `_PUBLIC_COLUMNS` y nunca devuelve `encrypted_password`.
+
+## Cuándo no usar el envelope
+
+- `/health` y `/ready` responden JSON plano (`{"status": "ok", ...}`), que es lo que esperan los orquestadores.
+- `StreamingResponse`, `FileResponse` o redirecciones se devuelven directamente (ver `GET /api/v1/test/stream`).
+
+Fuera de esos casos:
 
 ```python
-from app.utils.response import empty, ApiResponse
+# ✅
+return success(data=user)
 
-@router.delete("/{id}", response_model=ApiResponse[None])
-async def delete_user(id: int):
-    controller.delete_user(id)
-    return empty("Usuario eliminado exitosamente")
-    # → {"message": "Usuario eliminado exitosamente"}
-
-    return empty()
-    # → {}
+# ❌ Rompe el formato estándar
+return {"id": 1, "name": "John"}
 ```
 
-## Formato de Errores
+---
 
-Los errores usan un formato independiente — **no se modifican con el envelope**. Salen del exception handler directamente:
-
-```json
-{"detail": {"msg": "Usuario no encontrado", "type": "AppHttpException"}}
-{"detail": {"msg": "Error de validación en: email, age", "type": "RequestValidationError",
-            "context": [{"field": "email", "msg": "..."}]}}
-{"detail": {"msg": "Demasiadas solicitudes. Límite: 100 per 1 minute", "type": "RateLimitExceeded"}}
-{"detail": {"msg": "Error interno del servidor", "type": "InternalServerError"}}
-```
-
-En `APP_ENV=development`, los errores incluyen `"context"` y `"loc"` con información técnica del error.
-
-## OpenAPI / Swagger
-
-Al usar `response_model=ApiResponse[UserOut]`, Swagger muestra el schema correcto y tipado de la respuesta. FastAPI **no aplica** `response_model` a las respuestas de exception handlers — no hay conflicto entre ambos formatos.
-
-## Resumen de Salidas
-
-| Situación | Salida JSON |
-|---|---|
-| `success(data=obj)` | `{"data": {...}}` |
-| `success(data=obj, message="ok")` | `{"data": {...}, "message": "ok"}` |
-| `paginated(items, total, pagination)` | `{"data": [...], "pagination": {...}}` |
-| `empty("msg")` | `{"message": "msg"}` |
-| `empty()` | `{}` |
-| Error controlado | `{"detail": {"msg": "...", "type": "..."}}` |
+Ver también: [Paginación](pagination.md) · [Manejo de Excepciones](exceptions.md)

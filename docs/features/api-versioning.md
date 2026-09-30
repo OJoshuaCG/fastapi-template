@@ -1,128 +1,133 @@
 # API Versionada
 
-## Concepto
-
-Cada versión de la API es una **sub-aplicación FastAPI independiente** montada en el app principal. Esto permite:
-
-- Documentación separada por versión (`/api/v1/docs`, `/api/v2/docs`)
-- Middlewares y handlers propios por versión
-- Coexistencia de v1 y v2 sin afectarse mutuamente
-- Migración gradual de endpoints
+Cada versión de la API es una **sub-app FastAPI** montada en la app raíz. Cada versión tiene su propia documentación, sus rutas y su límite de body, así que v1 y v2 pueden convivir sin afectarse.
 
 ## Estructura
 
 ```
-main.py  (app principal — solo /health y los mounts)
-├── GET /health
-├── /api/v1  → v1_app (sub-aplicación FastAPI)
-│   ├── GET /docs
-│   ├── GET /redoc
-│   └── /test/...
-└── /api/v2  → v2_app (cuando sea necesario)
-    ├── GET /docs
-    └── /...
+main.py → create_app()               App raíz (sin docs propios)
+├── GET /health                      liveness
+├── GET /ready                       readiness (BD)
+├── /api/v1 → create_versioned_app("v1")
+│   ├── /docs, /redoc, /openapi.json
+│   ├── /users/...
+│   └── /test/...                    solo fuera de producción
+└── /api/v2 → (cuando haga falta)
 ```
 
-## `create_versioned_app()` — La Factory
+## Qué vive en cada nivel
 
-Toda la configuración de middlewares y handlers está centralizada en `app/core/versioned_app.py`.
+| App raíz (`main.py`) | Sub-app versionada (`create_versioned_app`) |
+|---|---|
+| `ContextMiddleware` (request id, ContextVars) | Rutas de la versión |
+| `LoggerMiddleware` (access log) | Documentación (`/docs`, `/redoc`) |
+| `CORSMiddleware` | `RequestSizeMiddleware` (límite de body) |
+| Handlers de error (`register_exception_handlers`) | Handlers de error (`register_exception_handlers`) |
+| Lifespan: engine BD, cliente HTTP | |
+| `/health`, `/ready` | |
+
+> **Starlette no ejecuta el lifespan de las sub-apps montadas.** Todo recurso con ciclo de vida (BD, clientes, tareas) se inicia y se cierra en el lifespan de la app raíz.
+
+Los handlers de error se registran en los dos niveles para que cualquier error (un 404 en la raíz o un 422 dentro de v1) tenga el mismo formato.
+
+## `create_versioned_app()`
 
 ```python
-v1_app = create_versioned_app("v1")
+def create_versioned_app(version: str) -> FastAPI:
 ```
 
-Esto configura automáticamente en la sub-app:
-- `RequestSizeMiddleware` (validación de tamaño)
-- `CORSMiddleware` (orígenes desde `CORS_ORIGINS`)
-- `ContextMiddleware` (Request ID, ContextVars)
-- `LoggerMiddleware` (si `LOGGER_MIDDLEWARE_ENABLED=True`)
-- `SlowAPIMiddleware` + `limiter` (rate limiting global)
-- Handlers: `AppHttpException`, `RequestValidationError`, `RateLimitExceeded`, `Exception`
-- Docs en `/docs` y `/redoc` (si `DOCS_ENABLED=True`)
+- `version`: `"v1"`, `"v2"`... Se usa en el título (`"{APP_NAME} V1"`).
 
-## Agregar Rutas a v1
+Además configura:
 
-### 1. Crear el router
+- `RequestSizeMiddleware` con `REQUEST_MAX_SIZE_MB` para toda la versión (sin overrides por ruta). Ver [Middlewares](middlewares.md#requestsizemiddleware).
+- `generate_unique_id_function`: operation ids `"{Tag}-{nombre_función}"` (ej. `Users-get_user`), para que los clientes generados desde OpenAPI tengan nombres limpios.
+- Documentación según `DOCS_ENABLED` / `DOCS_PASSWORD_ENABLED` (abajo).
+- `telemetry=telemetry_config()`: la misma configuración de OpenTelemetry que la app raíz (`telemetry_config()` vive en `app/core/versioned_app.py` y se aplica a las dos).
 
-```python
-# app/routes/v1/users.py
-from fastapi import APIRouter
-from app.controllers.user_controller import UserController
-from app.utils.response import ApiResponse, success, paginated, empty
-from app.utils.pagination import PaginationDep
+La configuración sale del singleton `settings` (`from app.core.environment import settings`): ni `create_app()`, ni `create_versioned_app()`, ni `build_v1_router()` reciben `settings`. En tests se cambia con `monkeypatch.setattr(settings, "X", valor)` (se revierte solo).
 
-router = APIRouter(prefix="/users", tags=["Users"])
+## Registrar rutas
 
-@router.get("/", response_model=ApiResponse[list[dict]])
-async def list_users(pagination: PaginationDep):
-    controller = UserController()
-    users = controller.list_users()
-    return paginated(users, total=len(users), pagination=pagination)
-
-@router.get("/{user_id}", response_model=ApiResponse[dict])
-async def get_user(user_id: int):
-    controller = UserController()
-    return success(data=controller.get_user(user_id))
-```
-
-### 2. Registrar en el agregador de v1
+Cada versión expone una función que construye su router:
 
 ```python
 # app/routes/v1/routes.py
 from fastapi import APIRouter
-from app.routes.v1 import test, users  # agregar users
 
-router = APIRouter()
-router.include_router(test.router)
-router.include_router(users.router)   # agregar
+from app.core.environment import settings
+from app.routes.v1 import test, users
+
+
+def build_v1_router() -> APIRouter:
+    router = APIRouter()
+    router.include_router(users.router)
+
+    # Endpoints de ejemplo/diagnóstico: nunca en producción
+    if not settings.is_production:
+        router.include_router(test.router)
+    return router
 ```
 
-## Agregar v2
+Para una feature nueva, crea `app/routes/v1/posts.py` con `router = APIRouter(prefix="/posts", tags=["Posts"])` y agrégalo con `router.include_router(posts.router)`.
 
-### 1. Crear la estructura de rutas
-
-```
-app/routes/v2/
-├── __init__.py
-├── routes.py       # Agregador de v2
-└── users.py        # Puede reusar, modificar o reemplazar endpoints de v1
-```
-
-### 2. Registrar en `main.py`
+## Montaje en `main.py`
 
 ```python
-# main.py — descomentar las líneas de v2
-from app.routes.v2.routes import router as v2_router
+v1 = create_versioned_app("v1")
+v1.include_router(build_v1_router())
+app.mount("/api/v1", v1)
 
-v2_app = create_versioned_app("v2")
-v2_app.include_router(v2_router)
-app.mount("/api/v2", v2_app)
+app.state.versioned_apps = {"v1": v1}
 ```
 
-v1 queda intacto. Los clientes que usen `/api/v1/...` no se ven afectados.
+### Agregar v2
 
-## Exclusiones de RequestSizeMiddleware por Versión
+1. Crear `app/routes/v2/` con sus routers y `build_v2_router()`.
+2. En `create_app()`:
 
-Si una versión necesita rutas excluidas del middleware de tamaño:
+   ```python
+   v2 = create_versioned_app("v2")
+   v2.include_router(build_v2_router())
+   app.mount("/api/v2", v2)
+
+   app.state.versioned_apps = {"v1": v1, "v2": v2}
+   ```
+
+v2 puede reutilizar los controllers y models de v1. Normalmente solo cambian los schemas y las routes.
+
+## Documentación
+
+| `DOCS_ENABLED` | `DOCS_PASSWORD_ENABLED` | Resultado |
+|---|---|---|
+| vacío | — | habilitada fuera de producción, deshabilitada en producción |
+| `True` | `False` | `/api/v1/docs`, `/api/v1/redoc`, `/api/v1/openapi.json` públicos (en producción se registra un warning al arrancar) |
+| `True` | `True` | las tres rutas piden **HTTP Basic** (`DOCS_USER` / `DOCS_PASSWORD`); en staging y producción el password debe tener ≥ 12 caracteres |
+| `False` | — | sin documentación |
+
+La app raíz no tiene docs (`/docs` responde 404).
+
+## Tests y `dependency_overrides`
+
+Los `dependency_overrides` son **por app**. Las rutas viven en la sub-app, así que los overrides de sus dependencias se aplican ahí, a través de `app.state.versioned_apps`:
 
 ```python
-v1_app = create_versioned_app(
-    "v1",
-    excluded_request_size_paths=["/special-upload"],
-)
+from app.controllers.user_controller import get_user_controller
+
+
+async def test_controller_can_be_overridden(client, v1_app):  # v1_app = app.state.versioned_apps["v1"]
+    class FakeController:
+        async def get_user(self, user_id: int) -> dict: ...
+
+    v1_app.dependency_overrides[get_user_controller] = FakeController
+    try:
+        resp = await client.get("/api/v1/users/99")
+    finally:
+        v1_app.dependency_overrides.clear()
 ```
 
-## Rutas Disponibles
+Las rutas de la app raíz (`/health`, `/ready`) se reemplazan en la app raíz: `app.dependency_overrides[get_database] = ...`. Ver `tests/conftest.py`.
 
-| Ruta | Descripción |
-|---|---|
-| `GET /health` | Health check — sin versión, sin rate limiting |
-| `GET /api/v1/docs` | Swagger UI de v1 |
-| `GET /api/v1/redoc` | ReDoc de v1 |
-| `GET /api/v1/openapi.json` | Schema OpenAPI de v1 |
-| `GET /api/v1/test/ping` | Endpoint de prueba |
-| `GET /api/v1/test/paginated` | Ejemplo paginación |
-| `DELETE /api/v1/test/resource/{id}` | Ejemplo respuesta vacía |
-| `PUT /api/v1/test/custom-error` | Ejemplo manejo de errores |
-| `POST /api/v1/test/upload` | Ejemplo upload de un archivo |
-| `POST /api/v1/test/upload/multiple` | Ejemplo upload múltiple |
+---
+
+Ver también: [Middlewares](middlewares.md) · [Rate Limiting](rate-limiting.md)

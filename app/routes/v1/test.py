@@ -1,8 +1,18 @@
-from pathlib import Path
+"""
+Endpoints de ejemplo (solo fuera de producción, ver routes.py).
+"""
 
+import asyncio
+from typing import Annotated
+
+import anyio
 from fastapi import APIRouter, File, UploadFile
+from fastapi.responses import StreamingResponse
 
+from app.core.environment import settings
+from app.core.rate_limit import rate_limit
 from app.exceptions import AppHttpException
+from app.services.httpbin_service import HttpbinServiceDep
 from app.utils.file_upload import save_upload, save_uploads
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
@@ -10,134 +20,123 @@ from app.utils.response import ApiResponse, empty, paginated, success
 router = APIRouter(tags=["test"], prefix="/test")
 
 # ---------------------------------------------------------------------------
-# Ejemplos de uso del envelope estándar de respuesta
+# Envelope estándar de respuesta
 # ---------------------------------------------------------------------------
 
 
 @router.get("/ping", response_model=ApiResponse[dict])
 async def ping():
-    """Respuesta simple con data."""
     return success(data={"message": "pong!"})
 
 
 @router.get("/paginated", response_model=ApiResponse[list[dict]])
 async def paginated_example(pagination: PaginationDep):
-    """Respuesta paginada — data y pagination al mismo nivel."""
-    _mock_items = [{"id": i, "name": f"Item {i}"} for i in range(1, 51)]
-    page_items = _mock_items[pagination.offset : pagination.offset + pagination.size]
-    return paginated(page_items, total=len(_mock_items), pagination=pagination)
+    items = [{"id": i, "name": f"Item {i}"} for i in range(1, 51)]
+    page = items[pagination.offset : pagination.offset + pagination.size]
+    return paginated(page, total=len(items), pagination=pagination)
 
 
 @router.delete("/resource/{resource_id}", response_model=ApiResponse[None])
 async def delete_example(resource_id: int):
-    """Respuesta sin data — solo message (ej: DELETE)."""
     return empty(f"Recurso {resource_id} eliminado exitosamente")
 
 
 # ---------------------------------------------------------------------------
-# Ejemplos de manejo de errores (el formato detail es independiente al envelope)
+# Errores (formato `detail` independiente del envelope)
 # ---------------------------------------------------------------------------
 
 
 @router.put("/custom-error")
 async def custom_error():
-    """Demuestra que AppHttpException retorna detail, independiente del envelope."""
-    raise AppHttpException("Custom error")
+    raise AppHttpException(
+        "Error de ejemplo", 400, {"hint": "visible solo en development"}, code="example"
+    )
 
 
-@router.post("/syntax-error")
-async def syntax_error():
-    if None > 0:
-        return success(data={"message": "Syntax error!"})
-    return success(data={"message": "No syntax error!"})
+@router.post("/unhandled-error")
+async def unhandled_error():
+    raise RuntimeError("Error no controlado de ejemplo")
 
 
 # ---------------------------------------------------------------------------
-# Ejemplos de upload de archivos
+# Rate limit por ruta (además del límite global de la versión)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/login",
+    response_model=ApiResponse[dict],
+    dependencies=[rate_limit(settings.RATE_LIMIT_LOGIN)],  # leído al importar
+)
+async def login_example():
+    return success(data={"token": "fake"}, message="Ejemplo: límite estricto por IP")
+
+
+# ---------------------------------------------------------------------------
+# Servicio externo (ServiceClient): en un proyecto real lo llama el controller
+# ---------------------------------------------------------------------------
+
+
+@router.get("/external/echo", response_model=ApiResponse[dict])
+async def external_echo(httpbin: HttpbinServiceDep, q: str = "hola"):
+    """El X-Request-ID de esta request viaja al servicio externo."""
+    return success(data=await httpbin.echo({"q": q}))
+
+
+@router.get("/external/status/{code}", response_model=ApiResponse[dict])
+async def external_status(code: int, httpbin: HttpbinServiceDep):
+    """Probar la traducción: 500 → 502, 503 → 503, 401 → 502 (nunca se reenvía el 401)."""
+    return success(data={"status": await httpbin.status(code)})
+
+
+# ---------------------------------------------------------------------------
+# Streaming (los middlewares ASGI puros no bufferean la respuesta)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/stream")
+async def stream_example():
+    async def chunks():
+        for i in range(3):
+            yield f"chunk {i}\n"
+            await asyncio.sleep(0)
+
+    return StreamingResponse(chunks(), media_type="text/plain")
+
+
+# ---------------------------------------------------------------------------
+# Uploads
 # ---------------------------------------------------------------------------
 
 
 @router.post("/upload", response_model=ApiResponse[dict])
-async def upload_single(file: UploadFile = File(...)):
-    """
-    Ejemplo de upload de un solo archivo.
-
-    Flujo completo:
-      1. save_upload() valida y guarda el archivo en uploads/
-      2. El controller lee el archivo desde disco para procesarlo
-      3. El archivo temporal se elimina en el bloque finally
-
-    En un proyecto real, el paso 2 sería subir a S3/GCS/Azure o
-    procesar la imagen, parsear el CSV, etc.
-    """
-    # — Paso 1: guardar en uploads/ con validaciones
-    file_info = await save_upload(
+async def upload_single(file: Annotated[UploadFile, File()]):
+    """save_upload() guarda en uploads/ → se procesa → se elimina SIEMPRE en finally."""
+    info = await save_upload(
         file,
         allowed_types=["image/jpeg", "image/png", "image/webp", "text/plain"],
         max_size_mb=5,
     )
-
-    file_path = Path(file_info["path"])
-
+    path = anyio.Path(info["path"])
     try:
-        # — Paso 2: leer y procesar desde disco
-        #   read_bytes() → contenido binario (imágenes, PDFs, binarios)
-        #   read_text()  → contenido como string (CSV, JSON, TXT)
-        raw_content = file_path.read_bytes()
-
-        # Aquí iría la lógica real: subir a bucket, procesar imagen, etc.
-        # Ejemplo: client_s3.upload(raw_content, key=file_info["filename"])
-
-        result = {
-            "original_filename": file_info["original_filename"],
-            "saved_as": file_info["filename"],
-            "content_type": file_info["content_type"],
-            "size_mb": file_info["size_mb"],
-            "size_bytes": file_info["size_bytes"],
-            "bytes_read": len(raw_content),
-        }
-
+        content = await path.read_bytes()  # aquí: subir a S3, procesar, etc.
+        result = {**info, "bytes_read": len(content)}
     finally:
-        # — Paso 3: eliminar el archivo temporal siempre, incluso si hay error
-        if file_path.exists():
-            file_path.unlink()
-
-    return success(data=result, message="Archivo procesado y eliminado exitosamente")
+        await path.unlink(missing_ok=True)
+    return success(data=result, message="Archivo procesado y eliminado")
 
 
 @router.post("/upload/multiple", response_model=ApiResponse[list[dict]])
-async def upload_multiple(files: list[UploadFile] = File(...)):
-    """
-    Ejemplo de upload de múltiples archivos simultáneos.
-
-    Cada archivo se guarda, procesa y elimina individualmente.
-    Si un archivo falla la validación, los anteriores ya guardados
-    quedan en disco — el developer decide cómo manejar el rollback.
-    """
-    saved_files = await save_uploads(
-        files,
-        allowed_types=["image/jpeg", "image/png", "image/webp"],
-        max_size_mb=5,
+async def upload_multiple(files: Annotated[list[UploadFile], File()]):
+    saved = await save_uploads(
+        files, allowed_types=["image/jpeg", "image/png", "image/webp"], max_size_mb=5
     )
-
     results = []
-    for file_info in saved_files:
-        file_path = Path(file_info["path"])
+    for info in saved:
+        path = anyio.Path(info["path"])
         try:
-            raw_content = file_path.read_bytes()
-
-            # Lógica de procesamiento por archivo...
-
-            results.append(
-                {
-                    "original_filename": file_info["original_filename"],
-                    "content_type": file_info["content_type"],
-                    "size_mb": file_info["size_mb"],
-                    "bytes_read": len(raw_content),
-                }
-            )
+            content = await path.read_bytes()
+            results.append({**info, "bytes_read": len(content)})
         finally:
-            if file_path.exists():
-                file_path.unlink()
-
+            await path.unlink(missing_ok=True)
     return success(data=results, message=f"{len(results)} archivo(s) procesado(s)")

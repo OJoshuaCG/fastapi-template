@@ -1,65 +1,60 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Builder: instala dependencias con uv y genera el entorno virtual
+# Builder: instala dependencias con uv
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.13-slim AS builder
+FROM python:3.14-slim AS builder
 
-# Copiar binario de uv desde la imagen oficial (más rápido que pip install uv)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# uv con versión fija (build reproducible); solo existe en esta etapa
+COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /bin/uv
 
 WORKDIR /app
 
-# Evitar que uv descargue Python (usamos el del sistema base)
-# UV_LINK_MODE=copy es necesario en Docker (no hay hardlinks entre capas)
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=0
 
-# Instalar dependencias primero (esta capa se cachea si pyproject.toml/uv.lock no cambian)
+# Extras opcionales, ej: docker build --build-arg UV_EXTRAS="--extra redis" .
+ARG UV_EXTRAS=""
+
+# 1) Dependencias (capa cacheada mientras pyproject.toml/uv.lock no cambien)
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project ${UV_EXTRAS}
 
-# Copiar el código fuente e instalar el proyecto
+# 2) Código del proyecto
 COPY . .
-RUN uv sync --frozen --no-dev
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev ${UV_EXTRAS} \
+    && chmod +x docker/scripts/entrypoint.sh
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Production: imagen final mínima y segura
+# Production: imagen mínima, sin uv ni curl, usuario sin privilegios
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.13-slim AS production
+FROM python:3.14-slim AS production
 
-# uv disponible en producción para comandos de entorno (alembic, etc.)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-# Dependencias de sistema mínimas (curl para el healthcheck)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Usuario no-root para mayor seguridad
-RUN groupadd --gid 1000 appuser \
-    && useradd --uid 1000 --gid appuser --shell /bin/bash --create-home appuser
+RUN groupadd --gid 1000 app \
+    && useradd --uid 1000 --gid app --shell /usr/sbin/nologin --no-create-home app
 
 WORKDIR /app
+# Código y venv propiedad de root (no escribibles en runtime); solo uploads/ es del usuario app
+COPY --from=builder /app /app
+RUN mkdir -p /app/uploads && chown app:app /app/uploads
 
-# Copiar entorno virtual y código desde el builder (con ownership correcto)
-COPY --from=builder --chown=appuser:appuser /app /app
+USER app
 
-# Hacer ejecutable el entrypoint (como root antes de cambiar de usuario)
-RUN chmod +x /app/docker/scripts/entrypoint.sh
-
-USER appuser
-
-# Virtual env en PATH para ejecutar uvicorn/alembic directamente
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH="/app" \
-    UV_PYTHON_DOWNLOADS=0
+    PORT=8000 \
+    WORKERS=1 \
+    GRACEFUL_TIMEOUT=8 \
+    FORWARDED_ALLOW_IPS=127.0.0.1
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+# Healthcheck en Python puro (sin instalar curl). /health no depende de la BD.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import os,sys,urllib.request as u; sys.exit(0 if u.urlopen(f'http://127.0.0.1:{os.getenv(\"PORT\",\"8000\")}/health', timeout=4).status == 200 else 1)"]
 
 ENTRYPOINT ["/app/docker/scripts/entrypoint.sh"]
+CMD ["serve"]

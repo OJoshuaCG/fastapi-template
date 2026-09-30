@@ -1,355 +1,233 @@
 # FastAPI Template
 
-> **Plantilla profesional de FastAPI lista para producción, con arquitectura MVC, versionado de API, seguridad, utilidades y mejores prácticas integradas.**
+> **Plantilla FastAPI 100% async (MariaDB/MySQL) lista para producción: arquitectura MVC, API versionada por sub-apps, respuestas y errores estandarizados, rate limiting, observabilidad y despliegue con Docker + Nginx.**
 
 ## Características
 
 | Categoría | Funcionalidad |
 |---|---|
-| **Arquitectura** | Patrón MVC (Routes → Controllers → Models), API versionada por sub-apps |
-| **Respuestas** | Envelope estándar (`ApiResponse[T]`) con helpers `success()`, `paginated()`, `empty()` |
-| **Middlewares** | Context, Logger (configurable), CORS, Rate Limiting, Request Size |
-| **Seguridad** | JWT (`JWTService`), cifrado Fernet (`CryptoService`), gestión de secretos |
-| **Base de Datos** | SQLAlchemy 2.0, SQL directo, Stored Procedures, pool de conexiones |
-| **Migraciones** | Alembic configurado y listo para usar |
-| **Errores** | Handlers globales para `AppHttpException`, `RequestValidationError`, `RateLimitExceeded` |
-| **Paginación** | `PaginationDep` inyectable con `Depends()`, respuesta estandarizada |
-| **File Upload** | `save_upload()` / `save_uploads()` con validación de tipo y tamaño |
-| **Logging** | Logger centralizado con trazabilidad por Request ID |
-| **Configuración** | Variables de entorno centralizadas en `environments.py` |
+| **Arquitectura** | Routes → Controllers → Models → Database, inyección con `Depends`, API versionada por sub-apps |
+| **Async** | SQLAlchemy 2.1 async + `asyncmy`, cliente `httpx` compartido, uploads con `anyio`, trabajo de CPU en threads |
+| **Base de datos** | MariaDB / MySQL. SQL directo con `Database` (`fetch_one`, `fetch_all`, `execute`, `transaction`, `call_procedure`) |
+| **Esquema** | SQL plano en `database/` (`init/NNN_*.sql` en orden + `procedures/`), sin ORM ni Alembic (Alembic opcional: `uv add alembic`, ver `database/README.md`). `001_users.sql` crea la tabla `users` |
+| **Configuración** | `pydantic-settings` tipado y validado al arrancar (`app/core/environment.py` → `settings.DB_HOST`). `APP_ENV` obligatorio |
+| **Respuestas** | Envelope `ApiResponse[T]` con `success()`, `paginated()`, `empty()` |
+| **Errores** | `AppHttpException` + handlers globales con un único formato `{"detail": {...}}` y `request_id` |
+| **Rate limiting** | Global por IP en nginx (`limit_req`) + dependencia `rate_limit()` por ruta (librería `limits`); memoria o Redis |
+| **Middlewares** | ASGI puros: Context (Request ID), Logger, CORS, Request Size |
+| **Observabilidad** | Logs text/JSON con Request ID, OpenTelemetry nativo de FastAPI |
+| **Health** | `/health` (liveness) y `/ready` (readiness, 503 si la BD no responde) |
+| **Calidad** | Tests con pytest contra MariaDB real, Ruff (incluye reglas `ASYNC`), pre-commit |
+| **Despliegue** | Dockerfile multi-stage sin privilegios, compose con MariaDB (esquema inicial desde `database/init/`) + Nginx |
 
 ---
+
+## Requisitos
+
+- Python **3.13+** (`.python-version` fija 3.14)
+- [uv](https://docs.astral.sh/uv/)
+- MariaDB 10.6+/11 o MySQL 8 (o Docker para levantarla)
 
 ## Inicio Rápido
 
-### 1. Clonar y preparar
-
 ```bash
-git clone <tu-repositorio>
-cd fastapi-template
-
-# Si inicias un proyecto nuevo desde esta plantilla:
-rm -rf .git && git init
-```
-
-### 2. Instalar uv (gestor de paquetes)
-
-```bash
-# Linux / macOS
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Windows (PowerShell)
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-### 3. Instalar dependencias
-
-```bash
+# 1. Dependencias (incluye el grupo dev: pytest, ruff, etc.)
 uv sync
-```
 
-### 4. Configurar entorno
-
-```bash
+# 2. Entorno (APP_ENV es obligatorio: sin .env la app no arranca)
 cp .env.example .env
+#    editar DB_USER, DB_PASS, DB_NAME...
+
+# 3. Esquema (una vez, con la BD ya creada)
+mariadb -h localhost -u <user> -p <db> < database/init/001_users.sql
+mariadb -h localhost -u <user> -p <db> < database/procedures/sp_user_stats.sql   # SP de ejemplo
+
+# 4. Ejecutar
+uv run fastapi dev        # desarrollo con reload (reiniciar si cambia .env)
+uv run fastapi run        # modo producción local
 ```
-
-Editar `.env` con tus valores (ver [Variables de Entorno](#variables-de-entorno)).
-
-### 5. Ejecutar
-
-```bash
-# Desarrollo con hot-reload
-uv run uvicorn main:app --reload
-
-# Puerto específico
-uv run uvicorn main:app --reload --host 0.0.0.0 --port 8080
-```
-
-### 6. Verificar
 
 | URL | Descripción |
 |---|---|
-| `http://localhost:8000/health` | Health check |
+| `http://localhost:8000/health` | Liveness (no toca la BD) |
+| `http://localhost:8000/ready` | Readiness (verifica la BD, 503 si no responde) |
 | `http://localhost:8000/api/v1/docs` | Swagger UI v1 |
 | `http://localhost:8000/api/v1/redoc` | ReDoc v1 |
-| `http://localhost:8000/api/v1/test/ping` | Endpoint de prueba |
+| `http://localhost:8000/api/v1/users` | CRUD de ejemplo |
+| `http://localhost:8000/api/v1/test/ping` | Endpoints de ejemplo (no se registran en producción) |
+
+Guía detallada: [docs/getting-started.md](docs/getting-started.md).
 
 ---
 
-## Variables de Entorno
+## Configuración
 
-Todas las variables se documentan en `.env.example`. A continuación el resumen completo:
+Todas las variables se declaran en `app/core/environment.py` (`from app.core.environment import settings`, luego `settings.DB_HOST`: mismo nombre que la variable) y se documentan en `.env.example`, en la misma sección. En `.env.example` van sin comentar las variables que se revisan en cada proyecto y entorno (cambian entre dev/staging/prod o deben coincidir con nginx, la BD o los workers); las opcionales van comentadas con su default seguro (`# VAR=default`). Una variable vacía (`VAR=`) usa el default. Las más importantes:
 
-```env
-# ======= Application =======
-APP_ENV=development          # development | production
-APP_NAME="FastAPI Project"
-SECRET_KEY=tu_clave_secreta  # python -c "import secrets; print(secrets.token_hex(32))"
+| Variable | Descripción |
+|---|---|
+| `APP_ENV` | **Obligatoria**: `development` \| `test` \| `staging` \| `production` |
+| `SECRET_KEY` | Reservado para la auth del proyecto. En producción, mínimo 32 caracteres (la app no arranca si no) |
+| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME` | Conexión MariaDB/MySQL |
+| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE`, `DB_STATEMENT_TIMEOUT` | Pool y timeouts |
+| `DOCS_ENABLED`, `DOCS_PASSWORD_ENABLED`, `DOCS_USER`, `DOCS_PASSWORD` | Docs (vacío = habilitadas fuera de producción) |
+| `RATE_LIMIT_ENABLED`, `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REDIS_ENABLED`, `RATE_LIMIT_REDIS_URL` | Rate limiting |
+| `CORS_ORIGINS` | Orígenes separados por coma. Vacío = CORS deshabilitado. `*` prohibido en producción |
+| `LOGGER_LEVEL`, `LOG_FORMAT`, `LOGGER_MIDDLEWARE_*`, `LOGGER_EXCEPTIONS_ENABLED` | Logging |
+| `REQUEST_MAX_SIZE_MB`, `PAGINATION_MAX_SIZE`, `UPLOAD_DIR` | Límites y uploads |
+| `HTTP_CLIENT_*`, `OTEL_ENABLED` | Cliente HTTP y observabilidad |
+| `WORKERS` | Workers de uvicorn (lo usa el entrypoint de Docker) |
+| `ENV_FILE` | Archivo `.env` a leer (default `.env` de la raíz; vacío = ninguno, como en los tests) |
 
-# ======= Logger =======
-LOGGER_LEVEL=INFO
-LOGGER_MIDDLEWARE_ENABLED=True
-LOGGER_MIDDLEWARE_SHOW_HEADERS=False
-LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS=True
-LOGGER_MIDDLEWARE_SHOW_BODY=True
-LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS=True   # False = reemplaza URL con template de ruta
-LOGGER_EXCEPTIONS_ENABLED=False
-
-# ======= Docs =======
-DOCS_ENABLED=True            # False = desactiva /docs, /redoc y /openapi.json
-
-# ======= Rate Limiting =======
-RATE_LIMIT_DEFAULT=100/minute  # second | minute | hour | day
-
-# ======= Pagination =======
-PAGINATION_MAX_SIZE=50       # Máximo items/página. Hard cap en código: 200.
-
-# ======= Request Size =======
-REQUEST_MAX_SIZE_MB=10       # Aplica a POST, PUT, PATCH
-
-# ======= CORS =======
-CORS_ORIGINS=*               # Separados por coma. Nota: * + credentials no funciona en browsers.
-
-# ======= Database =======
-DB_HOST=localhost
-DB_USER=username
-DB_PASS=password
-DB_NAME=database
-DB_PORT=3306
-DB_ENGINE=sqlite             # sqlite | mysql+pymysql | postgresql+psycopg2
-```
+En producción la configuración se valida al arrancar y falla rápido ante valores inseguros (`SECRET_KEY` corto, `DB_PASS` vacío o débil, `CORS_ORIGINS=*`). `DOCS_PASSWORD` débil (con docs protegidos) también falla en staging.
 
 ---
 
-## Estructura del Proyecto
+## Estructura
 
-```
-fastapi-template/
-├── app/
-│   ├── core/
-│   │   ├── context.py          # ContextVars de request (Request ID, IP, método, etc.)
-│   │   ├── database.py         # Clase Database (SQL directo, ORM, Stored Procedures)
-│   │   ├── environments.py     # Todas las variables de entorno centralizadas
-│   │   ├── limiter.py          # Singleton de slowapi Limiter (rate limiting)
-│   │   ├── logger.py           # get_logger() centralizado
-│   │   └── versioned_app.py    # Factory create_versioned_app() para sub-apps versionadas
-│   ├── controllers/
-│   │   └── user_controller.py  # Ejemplo de controller (CRUD de usuarios)
-│   ├── exceptions/
-│   │   ├── AppHttpException.py     # Excepción HTTP personalizada con tracking
-│   │   ├── HandlerExceptions.py    # Handlers globales (App, Validation, RateLimit, Generic)
-│   │   └── __init__.py
-│   ├── middleware/
-│   │   ├── ContextMiddleware.py    # Genera Request ID, establece ContextVars
-│   │   ├── LoggerMiddleware.py     # Logging de requests/responses
-│   │   └── RequestSizeMiddleware.py # Valida tamaño máximo de body
-│   ├── models/
-│   │   ├── base.py             # DeclarativeBase, TimestampMixin (SQLAlchemy 2.0)
-│   │   ├── user.py             # Modelo ORM de ejemplo (para Alembic)
-│   │   ├── user_model.py       # Modelo de datos SQL directo (para MVC)
-│   │   └── __init__.py         # CRÍTICO: exportar modelos para Alembic
-│   ├── routes/
-│   │   ├── health.py           # GET /health (sin versión, sin rate limiting)
-│   │   └── v1/
-│   │       ├── routes.py       # Agregador de rutas v1
-│   │       └── test.py         # Endpoints de ejemplo y testing
-│   ├── security/
-│   │   ├── crypto.py           # CryptoService (Fernet — cifrado reversible)
-│   │   ├── jwt_service.py      # JWTService (crear y verificar tokens)
-│   │   └── secrets.py          # SecretManager (generar y derivar claves)
-│   └── utils/
-│       ├── dict_utils.py       # _sanitize_dict() (uso interno)
-│       ├── file_upload.py      # save_upload() / save_uploads()
-│       ├── pagination.py       # PaginationParams, PaginationDep
-│       └── response.py         # ApiResponse[T], success(), paginated(), empty()
-├── uploads/                    # Archivos temporales (ignorado por git, excepto .gitkeep)
-├── alembic/                    # Migraciones de base de datos
-├── docs/                       # Documentación detallada
-├── main.py                     # Punto de entrada: monta sub-apps y /health
-├── pyproject.toml
-└── .env.example
-```
+`app/` (core, models, controllers, routes, schemas, exceptions, middleware, utils), `database/` (esquema SQL), `tests/` y `docker/`. Árbol completo y responsabilidades por archivo: [docs/project-structure.md](docs/project-structure.md).
 
 ---
 
-## Arquitectura: API Versionada
-
-Cada versión de la API es una **sub-aplicación FastAPI independiente** con sus propios middlewares, handlers y documentación.
+## Arquitectura
 
 ```
-main.py
-├── GET /health              ← sin versión, sin rate limiting
-└── /api/v1  ←──────────────── v1_app (create_versioned_app("v1"))
-    ├── GET  /docs           ← Swagger de v1
-    ├── GET  /redoc          ← ReDoc de v1
-    └── /test/...            ← rutas de negocio v1
+main.py (app raíz: lifespan, Context/Logger/CORS, handlers de error)
+├── GET /health              ← liveness
+├── GET /ready               ← readiness (BD)
+└── /api/v1  → sub-app       ← create_versioned_app("v1"): docs,
+    ├── /docs, /redoc           límite de body, handlers de error
+    ├── /users                ← CRUD de ejemplo
+    └── /test/...             ← solo fuera de producción
 ```
+
+El lifespan de la app raíz inicia y cierra el cliente HTTP y el pool de la BD (Starlette no ejecuta el lifespan de sub-apps montadas).
 
 ### Agregar v2
 
 ```python
 # main.py
-from app.routes.v2.routes import router as v2_router
-
-v2_app = create_versioned_app("v2")
-v2_app.include_router(v2_router)
-app.mount("/api/v2", v2_app)
+v2 = create_versioned_app("v2")
+v2.include_router(build_v2_router())
+app.mount("/api/v2", v2)
 ```
-
-Crear `app/routes/v2/routes.py` con los nuevos routers. Las rutas v1 no se afectan.
 
 ---
 
 ## Patrones de Uso
 
-### Respuestas Estándar
+### Endpoint completo (Routes → Controllers → Models)
 
 ```python
-from app.utils.response import ApiResponse, success, paginated, empty
+# app/routes/v1/users.py
+@router.get("/{user_id}", response_model=ApiResponse[UserOut])
+async def get_user(user_id: int, users: UserControllerDep):
+    return success(data=await users.get_user(user_id))
 
-# Respuesta simple
-@router.get("/{id}", response_model=ApiResponse[UserOut])
-async def get_user(id: int):
-    user = controller.get_user(id)
-    return success(data=user)
 
-# Con mensaje
-    return success(data=user, message="Usuario creado exitosamente")
-
-# Paginada
-@router.get("/", response_model=ApiResponse[list[UserOut]])
-async def list_users(pagination: PaginationDep):
-    users = model.find_all(limit=pagination.size, offset=pagination.offset)
-    total = model.count()
-    return paginated(users, total=total, pagination=pagination)
-
-# Sin contenido (DELETE)
-@router.delete("/{id}", response_model=ApiResponse[None])
-async def delete_user(id: int):
-    controller.delete_user(id)
-    return empty("Usuario eliminado exitosamente")
+@router.get("", response_model=ApiResponse[list[UserOut]])
+async def list_users(users: UserControllerDep, pagination: PaginationDep):
+    items, total = await users.list_users(pagination)
+    return paginated(items, total=total, pagination=pagination)
 ```
 
-**Formato de respuesta exitosa:**
+```python
+# app/models/user_model.py
+class UserModel:
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def find_by_id(self, user_id: int) -> dict | None:
+        return await self.db.fetch_one(
+            "SELECT id, username, email FROM users WHERE id = :id", {"id": user_id}
+        )
+```
+
+### Respuestas
+
 ```json
-{"data": {"id": 1, "name": "John"}}
+{"data": {"id": 1, "username": "john"}}
 {"data": [...], "pagination": {"page": 1, "size": 20, "total": 150, "pages": 8, "has_next": true, "has_prev": false}}
 {"message": "Usuario eliminado exitosamente"}
 ```
 
-**Formato de error** (independiente del envelope):
-```json
-{"detail": {"msg": "Usuario no encontrado", "type": "AppHttpException"}}
-{"detail": {"msg": "Error de validación en: email, age", "type": "RequestValidationError"}}
-{"detail": {"msg": "Demasiadas solicitudes. Límite: 100 per 1 minute", "type": "RateLimitExceeded"}}
-```
-
-### Paginación
-
-```python
-from app.utils.pagination import PaginationDep
-from app.utils.response import ApiResponse, paginated
-
-@router.get("/users", response_model=ApiResponse[list[dict]])
-async def list_users(pagination: PaginationDep):
-    # pagination.page   → número de página (desde 1)
-    # pagination.size   → items por página
-    # pagination.offset → listo para SQL: LIMIT size OFFSET offset
-    users = model.find_all(limit=pagination.size, offset=pagination.offset)
-    total = model.count()
-    return paginated(users, total=total, pagination=pagination)
-```
-
-Query params: `GET /users?page=2&size=10`
-
-### File Upload
-
-```python
-from fastapi import File, UploadFile
-from pathlib import Path
-from app.utils.file_upload import save_upload, save_uploads
-from app.utils.response import ApiResponse, success
-
-@router.post("/avatar", response_model=ApiResponse[dict])
-async def upload_avatar(file: UploadFile = File(...)):
-    file_info = await save_upload(
-        file,
-        allowed_types=["image/jpeg", "image/png", "image/webp"],
-        max_size_mb=2,
-    )
-    file_path = Path(file_info["path"])
-    try:
-        content = file_path.read_bytes()
-        # Subir a S3, procesar imagen, etc.
-        return success(data={"url": "..."}, message="Avatar actualizado")
-    finally:
-        if file_path.exists():
-            file_path.unlink()  # Siempre eliminar el temporal
-```
-
-### Excepciones
+### Errores
 
 ```python
 from app.exceptions import AppHttpException
 
-raise AppHttpException(
-    message="Usuario no encontrado",
-    status_code=404,
-    context={"user_id": user_id}  # Solo visible en APP_ENV=development
-)
+raise AppHttpException("Usuario no encontrado", 404, {"user_id": user_id}, code="user_not_found")
 ```
 
-### Rate Limiting por Ruta
+```json
+{"detail": {"msg": "Usuario no encontrado", "type": "NotFound", "code": "user_not_found", "request_id": "..."}}
+```
+
+`context` solo se incluye en `APP_ENV=development`; `loc` (archivo/función/línea) solo en los 500 no controlados, también solo en development. Los errores de BD se traducen solos: duplicado → 409, pool agotado → 503, timeout de sentencia → 504.
+
+### Rate limiting por ruta
 
 ```python
-from fastapi import Request
-from app.core.limiter import limiter
+from app.core.rate_limit import rate_limit
 
-@router.post("/login")
-@limiter.limit("5/minute")          # Límite específico para este endpoint
-async def login(request: Request):  # request es requerido por slowapi
-    ...
+@router.post("/login", dependencies=[rate_limit("5/minute")])
+async def login(...): ...
 ```
 
-### Context (Request ID, IP, etc.)
+Responde 429 con header `Retry-After`. El límite global por IP lo aplica nginx (`limit_req`).
+
+### Servicios externos
+
+Cada API externa es un service que hereda de `ServiceClient` (pool propio, timeouts, reintentos seguros,
+`X-Request-ID` y errores traducidos a 502/503/504):
 
 ```python
-from app.core.context import current_http_identifier, current_request_ip
+class PaymentsService(ServiceClient):
+    name = "payments"
+    base_url = "https://api.payments.example/v1"
 
-request_id = current_http_identifier.get()
-client_ip  = current_request_ip.get()
+    async def get_order(self, order_id: str) -> dict:
+        return await self.get_json(f"/orders/{order_id}")
+
+PaymentsServiceDep = Annotated[PaymentsService, Depends(PaymentsService.instance)]
 ```
+
+Ejemplo completo: `app/services/httpbin_service.py`. Guía: [docs/features/services.md](docs/features/services.md).
+
+### Seguridad
+
+Cifrado reversible con rotación de llaves (`app/core/encryption.py`, `ENCRYPTION_KEYS`), contraseñas cifradas
+(auditables) y encoding de IDs públicos (`app/core/encoding.py`, sqids): [docs/features/security.md](docs/features/security.md).
+
+Trabajo de CPU o librerías síncronas: `await anyio.to_thread.run_sync(func, ...)`. Reglas completas en [docs/development/best-practices.md](docs/development/best-practices.md).
 
 ---
 
-## Flujo de una Request
+## Tests y calidad
 
+```bash
+docker compose -f docker-compose.test.yml up -d --wait   # MariaDB de test (puerto 3307, en RAM)
+uv run pytest                                            # tests con BD se omiten si no hay MariaDB
+docker compose -f docker-compose.test.yml down
+
+uv run ruff check .
+uv run ruff format .
+
+uv run --with pre-commit pre-commit install              # ruff + detect-secrets en cada commit
 ```
-Cliente
-  ↓
-RequestSizeMiddleware  → rechaza si body > REQUEST_MAX_SIZE_MB (POST/PUT/PATCH)
-  ↓
-CORSMiddleware         → agrega headers CORS, maneja preflight OPTIONS
-  ↓
-ContextMiddleware      → genera Request ID, establece ContextVars
-  ↓
-LoggerMiddleware       → inicia timer, loguea request
-  ↓
-SlowAPIMiddleware      → verifica rate limit por IP
-  ↓
-ExceptionMiddleware    → captura excepciones → handlers → JSONResponse
-  ↓
-Endpoint               → Controller → Model → Database
-  ↓
-(respuesta sube por el mismo stack en orden inverso)
-  ↓
-LoggerMiddleware       → loguea response (status, duración)
-  ↓
-ContextMiddleware      → inyecta X-Request-ID en headers, limpia contexto
-  ↓
-Cliente recibe respuesta con header X-Request-ID
+
+En pytest, cualquier `DeprecationWarning` (incluidas las de FastAPI, Starlette y uvicorn) y `RuntimeWarning` es un error.
+
+---
+
+## Docker
+
+```bash
+cp .env.example .env     # APP_ENV=production, SECRET_KEY, DB_USER, DB_PASS...
+docker compose up -d --build
 ```
+
+Servicios: `db` (MariaDB 11, arranca **vacía**: aplicar `database/init/*.sql` y `database/procedures/*.sql` con el gestor de BD, ver [database/README.md](database/README.md)) → `api` → `nginx`. Ver [docs/docker-deployment.md](docs/docker-deployment.md).
 
 ---
 
@@ -357,21 +235,16 @@ Cliente recibe respuesta con header X-Request-ID
 
 ```bash
 # Desarrollo
-uv run uvicorn main:app --reload
-uv run uvicorn main:app --reload --host 0.0.0.0 --port 8080
+uv run fastapi dev
+uv run fastapi dev --host 0.0.0.0 --port 8080
 
 # Dependencias
 uv add <paquete>
 uv add --group dev <paquete>
-uv remove <paquete>
-uv sync
+uv sync --extra redis          # rate limit compartido en Redis
 
-# Migraciones
-uv run alembic revision --autogenerate -m "descripción"
-uv run alembic upgrade head
-uv run alembic downgrade -1
-uv run alembic current
-uv run alembic history
+# Esquema: cambios nuevos = script numerado nuevo en database/init/
+mariadb -h <host> -u <user> -p <db> < database/init/002_descripcion.sql
 ```
 
 ---
@@ -380,6 +253,7 @@ uv run alembic history
 
 - [Inicio Rápido](docs/getting-started.md)
 - [Estructura del Proyecto](docs/project-structure.md)
+- [Mejores Prácticas (async)](docs/development/best-practices.md)
 - [API Versionada](docs/features/api-versioning.md)
 - [Respuestas Estándar](docs/features/response-format.md)
 - [Paginación](docs/features/pagination.md)
@@ -387,18 +261,18 @@ uv run alembic history
 - [Rate Limiting](docs/features/rate-limiting.md)
 - [CORS](docs/features/cors.md)
 - [Middlewares](docs/features/middlewares.md)
-- [Sistema de Logging](docs/features/logging.md)
-- [Manejo de Excepciones](docs/features/exceptions.md)
+- [Context](docs/features/context.md)
+- [Logging](docs/features/logging.md)
+- [Excepciones](docs/features/exceptions.md)
 - [Base de Datos](docs/features/database.md)
-- [Migraciones](README_MIGRATIONS.md)
+- [Esquema de BD](database/README.md)
+- [Despliegue](docs/deployment.md) · [Docker](docs/docker-deployment.md)
 
 ## Tecnologías
 
-- **[FastAPI](https://fastapi.tiangolo.com/)** — Framework web moderno y rápido
-- **[SQLAlchemy 2.0](https://docs.sqlalchemy.org/)** — ORM y SQL toolkit
-- **[Alembic](https://alembic.sqlalchemy.org/)** — Migraciones de base de datos
-- **[Pydantic v2](https://docs.pydantic.dev/)** — Validación de datos y schemas
-- **[slowapi](https://github.com/laurentS/slowapi)** — Rate limiting para Starlette/FastAPI
-- **[uv](https://github.com/astral-sh/uv)** — Gestor de paquetes ultrarrápido
-- **[Ruff](https://docs.astral.sh/ruff/)** — Linter y formateador extremadamente rápido
-- **Python 3.13+**
+- **[FastAPI](https://fastapi.tiangolo.com/)** 0.142 + **Starlette** 1.7
+- **[SQLAlchemy 2.1](https://docs.sqlalchemy.org/)** (async) + **asyncmy**
+- **[Pydantic v2](https://docs.pydantic.dev/)** + **pydantic-settings**
+- **[limits](https://limits.readthedocs.io/)** — rate limiting async
+- **[httpx](https://www.python-httpx.org/)** — cliente HTTP async
+- **[uv](https://docs.astral.sh/uv/)** y **[Ruff](https://docs.astral.sh/ruff/)**

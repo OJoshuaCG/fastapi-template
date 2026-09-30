@@ -1,179 +1,107 @@
 """
-User Model - Interacción con Base de Datos
-
-Este modelo maneja la interacción con la tabla 'users' usando SQL directo.
-Es llamado desde el UserController siguiendo el patrón MVC.
+UserModel: acceso a la tabla `users` con SQL directo (async).
 
 Patrón: Routes → Controllers → Models → Database
 """
 
-from app.core.database import Database
-from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from typing import Annotated, Any
+
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncConnection
+
+from app.core.database import Database, DatabaseDep
+
+# Nunca seleccionar encrypted_password en consultas que terminan en una respuesta
+_PUBLIC_COLUMNS = (
+    "id, username, email, full_name, notes, is_active, is_superuser, created_at, updated_at"
+)
+_INSERT_COLUMNS = (
+    "username",
+    "email",
+    "encrypted_password",
+    "full_name",
+    "notes",
+    "is_active",
+    "is_superuser",
+)
+# Whitelist: los nombres de columna se interpolan en el SQL, NUNCA aceptar claves arbitrarias
+_UPDATABLE_COLUMNS = frozenset(
+    {"email", "full_name", "notes", "is_active", "is_superuser", "encrypted_password"}
+)
 
 
 class UserModel:
-    """Model para operaciones CRUD de usuarios"""
+    def __init__(self, db: Database):
+        self.db = db
 
-    def __init__(self):
-        """Inicializar conexión a base de datos"""
-        self.db = Database(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
-
-    def find_by_id(self, user_id: int) -> dict | None:
-        """
-        Buscar usuario por ID
-
-        Args:
-            user_id: ID del usuario
-
-        Returns:
-            dict | None: Datos del usuario o None si no existe
-        """
-        return self.db.execute_query(
-            "SELECT * FROM users WHERE id = :id", {"id": user_id}, fetchone=True
+    async def find_by_id(self, user_id: int, *, conn: AsyncConnection | None = None) -> dict | None:
+        return await self.db.fetch_one(
+            f"SELECT {_PUBLIC_COLUMNS} FROM users WHERE id = :id",  # noqa: S608 — columnas constantes
+            {"id": user_id},
+            conn=conn,
         )
 
-    def find_by_username(self, username: str) -> dict | None:
-        """
-        Buscar usuario por username
-
-        Args:
-            username: Username del usuario
-
-        Returns:
-            dict | None: Datos del usuario o None si no existe
-        """
-        return self.db.execute_query(
-            "SELECT * FROM users WHERE username = :username",
-            {"username": username},
-            fetchone=True,
+    async def find_all(
+        self, *, limit: int, offset: int, is_active: bool | None = None
+    ) -> list[dict]:
+        where, params = self._filters(is_active)
+        return await self.db.fetch_all(
+            f"SELECT {_PUBLIC_COLUMNS} FROM users {where} "  # noqa: S608
+            "ORDER BY id DESC LIMIT :limit OFFSET :offset",
+            {**params, "limit": limit, "offset": offset},
         )
 
-    def find_by_email(self, email: str) -> dict | None:
-        """
-        Buscar usuario por email
+    async def count(self, *, is_active: bool | None = None) -> int:
+        where, params = self._filters(is_active)
+        return int(await self.db.fetch_value(f"SELECT COUNT(*) FROM users {where}", params) or 0)  # noqa: S608
 
-        Args:
-            email: Email del usuario
-
-        Returns:
-            dict | None: Datos del usuario o None si no existe
-        """
-        return self.db.execute_query(
-            "SELECT * FROM users WHERE email = :email", {"email": email}, fetchone=True
+    async def create(self, data: dict[str, Any], *, conn: AsyncConnection | None = None) -> int:
+        """Inserta y retorna el id. Un username/email duplicado lanza 409 (lo decide el UNIQUE)."""
+        params = {col: data.get(col) for col in _INSERT_COLUMNS}
+        result = await self.db.execute(
+            """
+            INSERT INTO users
+                (username, email, encrypted_password, full_name, notes, is_active, is_superuser)
+            VALUES (:username, :email, :encrypted_password, :full_name, :notes,
+                    COALESCE(:is_active, 1), COALESCE(:is_superuser, 0))
+            """,
+            params,
+            conn=conn,
         )
+        return int(result.lastrowid or 0)
 
-    def find_all(self, is_active: bool | None = None) -> list[dict]:
-        """
-        Listar todos los usuarios con filtros opcionales
+    async def update(
+        self, user_id: int, data: dict[str, Any], *, conn: AsyncConnection | None = None
+    ) -> int:
+        """Actualiza solo columnas de la whitelist. Retorna filas encontradas."""
+        unknown = set(data) - _UPDATABLE_COLUMNS
+        if unknown:
+            # Error de programación (el schema no debería permitirlo), no un error HTTP:
+            # los models no conocen la capa HTTP
+            raise ValueError(f"Columnas no actualizables: {sorted(unknown)}")
+        if not data:
+            return 0
+        set_clause = ", ".join(f"{col} = :{col}" for col in data)  # col ∈ whitelist
+        result = await self.db.execute(
+            f"UPDATE users SET {set_clause} WHERE id = :id",  # noqa: S608
+            {**data, "id": user_id},
+            conn=conn,
+        )
+        return result.rowcount
 
-        Args:
-            is_active: Filtrar por estado activo (opcional)
+    async def delete(self, user_id: int) -> int:
+        result = await self.db.execute("DELETE FROM users WHERE id = :id", {"id": user_id})
+        return result.rowcount
 
-        Returns:
-            list[dict]: Lista de usuarios
-        """
+    @staticmethod
+    def _filters(is_active: bool | None) -> tuple[str, dict[str, Any]]:
         if is_active is None:
-            query = "SELECT * FROM users ORDER BY created_at DESC"
-            params = {}
-        else:
-            query = "SELECT * FROM users WHERE is_active = :is_active ORDER BY created_at DESC"
-            params = {"is_active": is_active}
+            return "", {}
+        return "WHERE is_active = :is_active", {"is_active": is_active}
 
-        return self.db.execute_query(query, params, fetchone=False)
 
-    def create(self, user_data: dict) -> int:
-        """
-        Crear nuevo usuario
+def get_user_model(db: DatabaseDep) -> UserModel:
+    return UserModel(db)
 
-        Args:
-            user_data: Diccionario con datos del usuario
-                - username (str): Username único
-                - email (str): Email único
-                - hashed_password (str): Password hasheado
-                - full_name (str, optional): Nombre completo
-                - notes (str, optional): Notas adicionales
-                - is_active (bool, optional): Estado activo (default: True)
-                - is_superuser (bool, optional): Es superusuario (default: False)
 
-        Returns:
-            int: ID del usuario creado
-        """
-        query = """
-            INSERT INTO users (
-                username,
-                email,
-                hashed_password,
-                full_name,
-                notes,
-                is_active,
-                is_superuser
-            ) VALUES (
-                :username,
-                :email,
-                :hashed_password,
-                :full_name,
-                :notes,
-                COALESCE(:is_active, 1),
-                COALESCE(:is_superuser, 0)
-            )
-        """
-
-        # Retorna el ID del usuario creado
-        return self.db.execute_query(query, user_data)
-
-    def update(self, user_id: int, user_data: dict) -> int:
-        """
-        Actualizar usuario existente
-
-        Args:
-            user_id: ID del usuario
-            user_data: Diccionario con datos a actualizar
-
-        Returns:
-            int: Número de filas afectadas
-        """
-        # Construir SET clause dinámicamente
-        set_clause = ", ".join([f"{key} = :{key}" for key in user_data.keys()])
-
-        query = f"UPDATE users SET {set_clause} WHERE id = :id"
-
-        # Agregar user_id a params
-        params = {**user_data, "id": user_id}
-
-        # Retorna número de filas afectadas
-        return self.db.execute_query(query, params)
-
-    def delete(self, user_id: int) -> int:
-        """
-        Eliminar usuario permanentemente (hard delete)
-
-        Args:
-            user_id: ID del usuario
-
-        Returns:
-            int: Número de filas eliminadas
-        """
-        query = "DELETE FROM users WHERE id = :id"
-
-        # Retorna número de filas eliminadas
-        return self.db.execute_query(query, {"id": user_id})
-
-    def count(self, is_active: bool | None = None) -> int:
-        """
-        Contar usuarios con filtros opcionales
-
-        Args:
-            is_active: Filtrar por estado activo (opcional)
-
-        Returns:
-            int: Número de usuarios
-        """
-        if is_active is None:
-            query = "SELECT COUNT(*) as total FROM users"
-            params = {}
-        else:
-            query = "SELECT COUNT(*) as total FROM users WHERE is_active = :is_active"
-            params = {"is_active": is_active}
-
-        result = self.db.execute_query(query, params, fetchone=True)
-        return result["total"] if result else 0
+UserModelDep = Annotated[UserModel, Depends(get_user_model)]

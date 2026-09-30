@@ -5,11 +5,21 @@ services:
     image: mariadb:11
     restart: unless-stopped
     environment:
-      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASS:?DB_ROOT_PASS es requerido en .env}
+      # root con contraseña aleatoria: la app y los gestores de BD usan DB_USER/DB_PASS
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
       MARIADB_DATABASE:      ${DB_NAME:?DB_NAME es requerido en .env}
       MARIADB_USER:          ${DB_USER:?DB_USER es requerido en .env}
       MARIADB_PASSWORD:      ${DB_PASS:?DB_PASS es requerido en .env}
+    # max_connections debe cubrir WORKERS × (DB_POOL_SIZE + DB_MAX_OVERFLOW) × réplicas + margen
+    # wait_timeout debe ser mayor que DB_POOL_RECYCLE (180s)
+    # collation del servidor = DB_COLLATION: la base creada y la sesión de la app coinciden
+    command:
+      - --max-connections=300
+      - --wait-timeout=600
+      - --character-set-server=utf8mb4
+      - --collation-server=${DB_COLLATION:-utf8mb4_unicode_ci}
     volumes:
+      # La base arranca vacía: el esquema (database/*.sql) se aplica con el gestor de BD
       - mariadb_data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--su-mysql", "--connect", "--innodb_initialized"]
@@ -24,18 +34,19 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile
       target: production
     restart: unless-stopped
-    # Carga variables del archivo .env si existe (no falla si no existe)
     env_file:
       - path: .env
         required: false
     environment:
-      # Estas variables se sobrescriben siempre, independiente del .env
-      # para garantizar que la app use los servicios Docker correctos
-      DB_ENGINE: mysql+pymysql
       DB_HOST: db
+      DB_PORT: "3306"
+      # Solo nginx puede fijar la IP del cliente vía X-Forwarded-For
+      FORWARDED_ALLOW_IPS: "172.28.0.0/24"
+      # Menor que stop_grace_period para que el lifespan alcance a cerrar el pool
+      GRACEFUL_TIMEOUT: "20"
+    stop_grace_period: 30s
     volumes:
       - uploads_data:/app/uploads
     expose:
@@ -58,23 +69,26 @@ services:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
       - nginx_logs:/var/log/nginx
-      # Volúmenes para SSL con Certbot (se configuran cuando se obtienen certificados)
       - certbot_www:/var/www/certbot:ro
       - certbot_certs:/etc/letsencrypt:ro
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     networks:
       - frontend
 
 volumes:
-  mariadb_data:   # Datos persistentes de MariaDB
-  uploads_data:   # Archivos subidos por la aplicación
-  nginx_logs:     # Logs de acceso/error de Nginx
-  certbot_www:    # Directorio para verificación ACME (Let's Encrypt)
-  certbot_certs:  # Certificados SSL generados por Certbot
+  mariadb_data:
+  uploads_data:
+  nginx_logs:
+  certbot_www:
+  certbot_certs:
 
 networks:
-  backend:   # Red interna: API ↔ MariaDB (no expuesta al exterior)
+  backend:   # API ↔ MariaDB (interna)
     driver: bridge
-  frontend:  # Red de entrada: Nginx ↔ API
+  frontend:  # Nginx ↔ API
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

@@ -2,10 +2,15 @@ from typing import Annotated
 
 from fastapi import Depends, Query
 
-from app.core.environments import PAGINATION_MAX_SIZE
+from app.core.environment import settings
+
+# Leído al importar (configurar por entorno): el límite forma parte del esquema OpenAPI (le=)
+PAGINATION_MAX_SIZE = settings.PAGINATION_MAX_SIZE
 
 # Tamaño por defecto cuando el cliente no especifica ?size=
 _DEFAULT_SIZE = 20
+# Tope de página: evita OFFSET gigantes (?page=10**20) que revientan en SQL
+_MAX_PAGE = 1_000_000
 
 
 class PaginationParams:
@@ -20,10 +25,9 @@ class PaginationParams:
         from app.utils.response import ApiResponse, paginated
 
         @router.get("/users", response_model=ApiResponse[list[UserOut]])
-        async def list_users(pagination: PaginationDep):
-            users = model.find_all(limit=pagination.size, offset=pagination.offset)
-            total = model.count()
-            return paginated(users, total=total, pagination=pagination)
+        async def list_users(pagination: PaginationDep, users: UserControllerDep):
+            items, total = await users.list_users(pagination)
+            return paginated(items, total=total, pagination=pagination)
 
     Query params aceptados:
         ?page=1&size=20
@@ -31,13 +35,17 @@ class PaginationParams:
 
     def __init__(
         self,
-        page: int = Query(1, ge=1, description="Número de página (inicia en 1)"),
-        size: int = Query(
-            _DEFAULT_SIZE,
-            ge=1,
-            le=PAGINATION_MAX_SIZE,
-            description=f"Elementos por página (máximo {PAGINATION_MAX_SIZE})",
-        ),
+        page: Annotated[
+            int, Query(ge=1, le=_MAX_PAGE, description="Número de página (inicia en 1)")
+        ] = 1,
+        size: Annotated[
+            int,
+            Query(
+                ge=1,
+                le=PAGINATION_MAX_SIZE,
+                description=f"Elementos por página (máximo {PAGINATION_MAX_SIZE})",
+            ),
+        ] = _DEFAULT_SIZE,
     ):
         self.page = page
         self.size = size

@@ -1,665 +1,231 @@
 # Guía de Despliegue
 
-Esta guía cubre cómo desplegar la aplicación FastAPI en diferentes entornos de producción.
+Conceptos y configuración de producción, válidos con o sin Docker. Para el paso a paso con Docker Compose + Nginx + MariaDB ver [docker-deployment.md](docker-deployment.md).
 
-## Preparación para Producción
+---
 
-### 1. Variables de Entorno
-
-Crear `.env` para producción:
-
-```env
-# Aplicación
-APP_ENV=production
-APP_NAME="Mi API"
-SECRET_KEY=<generar_clave_secreta_fuerte>
-
-# Base de Datos
-DB_HOST=db.production.example.com
-DB_USER=api_user
-DB_PASS=<contraseña_segura>
-DB_NAME=api_production
-DB_PORT=3306
-
-# Logging
-LOGGER_LEVEL=WARNING
-LOGGER_MIDDLEWARE_ENABLED=True
-LOGGER_MIDDLEWARE_SHOW_HEADERS=False
-LOGGER_EXCEPTIONS_ENABLED=True
-```
-
-**Generar SECRET_KEY segura:**
+## 1. Configuración de Producción
 
 ```bash
-python -c "import secrets; print(secrets.token_hex(32))"
+cp .env.example .env
 ```
 
-### 2. Dependencias de Producción
+| Variable | Valor en producción |
+|---|---|
+| `APP_ENV` | `production` (obligatoria) |
+| `SECRET_KEY` | Reservado para la auth del proyecto. 32+ caracteres: `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `DB_PASS` | Contraseña fuerte (vacía o débil = la app no arranca) |
+| `ENCRYPTION_KEYS` | Obligatoria en staging y producción. `uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Guardarla y respaldarla **aparte** del backup de la BD: sin ella no se descifran datos ni contraseñas |
+| `ENCODING_ALPHABET` | Propio del proyecto y **fijo para siempre** (cambiarlo invalida los IDs ya compartidos). `uv run python -c "import random, string; a = list(string.ascii_letters + string.digits); random.shuffle(a); print(''.join(a))"` |
+| `CORS_ORIGINS` | Dominios exactos: `https://app.com,https://admin.app.com` (`*` prohibido) |
+| `DOCS_ENABLED` | Vacío = deshabilitadas en producción. Si se habilitan, usar `DOCS_PASSWORD_ENABLED=True` y `DOCS_PASSWORD` de 12+ caracteres (obligatorio en staging y producción) |
+| `LOG_FORMAT` | `json` si hay agregador de logs |
+| `LOGGER_MIDDLEWARE_ERRORS_ONLY` | `True` para registrar solo requests con error |
+| `WORKERS` | Workers de uvicorn (lo lee el entrypoint / el comando de uvicorn, no la app) |
+| `RATE_LIMIT_REDIS_ENABLED` | `True` si `WORKERS > 1` o hay varias réplicas |
+
+La configuración se valida al arrancar (`app/core/environment.py`): si algo es inválido o inseguro, el proceso termina con `Configuración inválida: ...` (lista las variables por nombre, nunca sus valores) en lugar de arrancar mal. Los problemas no fatales (docs públicas en producción, `SECRET_KEY` vacío, variables desconocidas en el `.env`) se registran como warnings al iniciar; el aviso de rate limit en memoria con varios workers lo imprime el entrypoint de Docker.
+
+---
+
+## 2. Proceso: uvicorn
+
+`docker/scripts/entrypoint.sh serve` ejecuta:
 
 ```bash
-# Sincronizar dependencias
-uv sync --no-dev
-
-# O instalar solo dependencias de producción
-uv sync --frozen
+uvicorn main:app \
+    --host 0.0.0.0 --port "${PORT:-8000}" \
+    --workers "${WORKERS:-1}" \
+    --proxy-headers \
+    --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-127.0.0.1}" \
+    --timeout-graceful-shutdown "${GRACEFUL_TIMEOUT:-8}" \
+    --no-access-log --no-server-header
 ```
 
-### 3. Migraciones
+El script también funciona fuera de Docker (necesita `uvicorn` en el `PATH`, ej. `.venv/bin`).
+
+### IP real del cliente (`FORWARDED_ALLOW_IPS`)
+
+El rate limit y los logs usan la IP del cliente. Detrás de un proxy, uvicorn solo acepta `X-Forwarded-For` de las IPs listadas en `--forwarded-allow-ips`:
+
+- Solo la IP o red del proxy (`127.0.0.1` en bare-metal, `172.28.0.0/24` en el compose).
+- **Nunca `*`**: cualquier cliente podría falsificar su IP y saltarse el rate limit.
+- El proxy de borde debe **reemplazar** el header, no concatenarlo: nginx usa `X-Forwarded-For $remote_addr` (no `$proxy_add_x_forwarded_for`).
+
+### Workers y pool de conexiones
+
+Cada worker es un proceso con su propio pool. Regla:
+
+```
+WORKERS × (DB_POOL_SIZE + DB_MAX_OVERFLOW) × réplicas  <  max_connections del servidor
+```
+
+Con los defaults (10 + 10) y 2 workers son hasta 40 conexiones por réplica; el compose configura MariaDB con `--max-connections=300`.
+
+- `DB_POOL_TIMEOUT=3`: con el pool agotado se responde 503 rápido en lugar de congelar el worker.
+- `DB_POOL_RECYCLE` debe ser menor que `wait_timeout` del servidor (el compose usa `--wait-timeout=600`).
+- `DB_STATEMENT_TIMEOUT` corta sentencias largas en el servidor (504).
+
+### Apagado ordenado
+
+Al recibir `SIGTERM`, uvicorn deja de aceptar conexiones, espera hasta `GRACEFUL_TIMEOUT` segundos a las requests en curso y ejecuta el lifespan de cierre (cliente HTTP → pool de la BD). `GRACEFUL_TIMEOUT` debe ser **menor** que el tiempo que el orquestador espera antes de `SIGKILL` (`stop_grace_period` en compose, `TimeoutStopSec` en systemd, `terminationGracePeriodSeconds` en Kubernetes).
+
+### Rate limit con varios procesos
+
+En memoria, cada worker cuenta por separado (el límite efectivo se multiplica). Opciones:
+
+- `RATE_LIMIT_REDIS_ENABLED=True` + `RATE_LIMIT_REDIS_URL` (instalar con `uv sync --extra redis`; en Docker, `--build-arg UV_EXTRAS="--extra redis"`). Si Redis falla o está mal configurado, las requests pasan (fail-open) y se registra un warning.
+- `limit_req` de nginx (ya configurado: 20 r/s por IP, burst 40), compartido entre todos los workers. Es el freno duro: el rate limit de la app es una dependencia y FastAPI la resuelve después de recibir el body.
+
+---
+
+## 3. Esquema de la Base de Datos
+
+El esquema es SQL plano en `database/` (no se usa ORM ni Alembic) y la API **no** lo modifica al arrancar:
+
+- Instalación nueva: aplicar `database/init/*.sql` en orden. Con Docker Compose, MariaDB los ejecuta solo al crear el volumen vacío.
+- Cambios posteriores: un script nuevo numerado (`002_add_posts.sql`...) aplicado **una vez** por despliegue, antes de levantar la nueva versión, a mano o por el DBA:
+
+  ```bash
+  mariadb -h <host> -u <user> -p <db> < database/init/002_add_posts.sql
+  ```
+
+Hacer backup antes de aplicar cambios de esquema. Ver [database/README.md](../database/README.md).
+
+---
+
+## 4. Health Checks
+
+| Endpoint | Tipo | Comportamiento |
+|---|---|---|
+| `GET /health` | Liveness | No toca dependencias. `200 {"status": "ok", "service": "<APP_NAME>"}` mientras el proceso atienda |
+| `GET /ready` | Readiness | `SELECT 1` con timeout de 2 s. `200` con BD arriba, `503 {"status": "unavailable", "checks": {"database": "down"}}` si no (y un warning en el log con la causa) |
+
+- Usar `/health` para reiniciar el contenedor/proceso y `/ready` para sacarlo del balanceo. Así una caída de la BD no provoca un bucle de reinicios.
+- Si la BD no responde al arrancar, la app inicia igual y `/ready` lo reporta.
+- Ninguno de los dos pasa por el log de requests (ni tiene `rate_limit()` propio). nginx sí les aplica `limit_req` (`burst=20`) para que `/ready` no sirva para martillar la BD.
+
+---
+
+## 5. Observabilidad
+
+- **Logs**: `LOG_FORMAT=json` para Loki/ELK/Datadog. Cada línea lleva `request_id`.
+- **Request ID**: se acepta un `X-Request-ID` entrante válido (nginx envía `$request_id`) o se genera uno; siempre vuelve en la respuesta. La misma request se correlaciona entre el log de nginx (`rid=`) y el de la app.
+- **Event loop**: si hay latencias sin explicación, diagnosticar bloqueos con `py-spy dump --pid <pid>` (ver [Detectar bloqueos del event loop](development/best-practices.md#detectar-bloqueos-del-event-loop)).
+- **OpenTelemetry**: telemetría nativa de FastAPI (`OTEL_ENABLED=True`). Solo exporta si se define `OTEL_EXPORTER_OTLP_ENDPOINT` (ej. `http://otel-collector:4318`). `/health` y `/ready` se excluyen.
+
+---
+
+## 6. Servidor Linux sin Docker (systemd)
+
+### Instalación
 
 ```bash
-# Aplicar todas las migraciones
-uv run alembic upgrade head
-
-# Verificar estado
-uv run alembic current
-```
-
-### 4. Configuración de Uvicorn
-
-**Archivo de configuración** (`gunicorn_conf.py`):
-
-```python
-import multiprocessing
-import os
-
-# Bind
-bind = f"0.0.0.0:{os.getenv('PORT', '8000')}"
-
-# Workers
-workers = int(os.getenv('WEB_CONCURRENCY', multiprocessing.cpu_count() * 2 + 1))
-worker_class = "uvicorn.workers.UvicornWorker"
-
-# Logging
-accesslog = "-"
-errorlog = "-"
-loglevel = os.getenv('LOG_LEVEL', 'info')
-
-# Timeouts
-timeout = 120
-keepalive = 5
-
-# Restart workers after N requests (previene memory leaks)
-max_requests = 1000
-max_requests_jitter = 50
-```
-
-## Opciones de Despliegue
-
-### Opción 1: Docker (Recomendado)
-
-#### Dockerfile
-
-```dockerfile
-# Dockerfile
-FROM python:3.13-slim
-
-WORKDIR /app
-
-# Instalar uv
-RUN pip install uv
-
-# Copiar archivos de dependencias
-COPY pyproject.toml uv.lock ./
-
-# Instalar dependencias
-RUN uv sync --no-dev --frozen
-
-# Copiar código de aplicación
-COPY . .
-
-# Exponer puerto
-EXPOSE 8000
-
-# Comando de inicio
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
-```
-
-#### docker-compose.yml
-
-```yaml
-version: '3.8'
-
-services:
-  api:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      - APP_ENV=production
-      - DB_HOST=db
-      - DB_USER=api_user
-      - DB_PASS=secure_password
-      - DB_NAME=api_db
-    depends_on:
-      - db
-    restart: unless-stopped
-
-  db:
-    image: mariadb:11
-    environment:
-      - MYSQL_ROOT_PASSWORD=root_password
-      - MYSQL_DATABASE=api_db
-      - MYSQL_USER=api_user
-      - MYSQL_PASSWORD=secure_password
-    volumes:
-      - db_data:/var/lib/mysql
-    restart: unless-stopped
-
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
-      - ./certs:/etc/nginx/certs
-    depends_on:
-      - api
-    restart: unless-stopped
-
-volumes:
-  db_data:
-```
-
-#### Construir y Ejecutar
-
-```bash
-# Construir imagen
-docker build -t mi-api .
-
-# Ejecutar contenedor
-docker run -d \
-  -p 8000:8000 \
-  --env-file .env.production \
-  --name mi-api \
-  mi-api
-
-# Con docker-compose
-docker-compose up -d
-
-# Ver logs
-docker-compose logs -f api
-
-# Ejecutar migraciones
-docker-compose exec api uv run alembic upgrade head
-```
-
-### Opción 2: Servidor Linux (VPS)
-
-#### 1. Instalar Dependencias
-
-```bash
-# Actualizar sistema
-sudo apt update && sudo apt upgrade -y
-
-# Instalar Python 3.13
-sudo apt install python3.13 python3.13-venv -y
-
-# Instalar uv
+sudo apt update && sudo apt install -y nginx mariadb-server git
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Instalar nginx
-sudo apt install nginx -y
-
-# Instalar MySQL/MariaDB
-sudo apt install mariadb-server -y
+sudo useradd --system --create-home --home-dir /opt/myapp --shell /usr/sbin/nologin app
+sudo -u app git clone <tu-repositorio> /opt/myapp/src
+cd /opt/myapp/src
+sudo -u app uv sync --frozen --no-dev
+sudo -u app cp .env.example .env    # editar: APP_ENV=production, SECRET_KEY, DB_*...
 ```
 
-#### 2. Configurar Aplicación
+### Base de datos
+
+```sql
+CREATE DATABASE app CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'app'@'localhost' IDENTIFIED BY '<contraseña_fuerte>';
+GRANT ALL PRIVILEGES ON app.* TO 'app'@'localhost';
+FLUSH PRIVILEGES;
+```
 
 ```bash
-# Crear usuario
-sudo useradd -m -s /bin/bash api
-
-# Clonar repositorio
-sudo -u api git clone <repo-url> /home/api/app
-cd /home/api/app
-
-# Instalar dependencias
-sudo -u api uv sync --no-dev
-
-# Configurar .env
-sudo -u api nano .env
+for f in database/init/*.sql; do mariadb -u app -p app < "$f"; done    # esquema inicial, en orden
 ```
 
-#### 3. Systemd Service
-
-Crear `/etc/systemd/system/api.service`:
+### Servicio
 
 ```ini
+# /etc/systemd/system/myapp.service
 [Unit]
-Description=FastAPI Application
-After=network.target
+Description=FastAPI myapp
+After=network.target mariadb.service
 
 [Service]
-Type=notify
-User=api
-Group=api
-WorkingDirectory=/home/api/app
-Environment="PATH=/home/api/.local/bin:/usr/local/bin:/usr/bin"
-ExecStart=/home/api/.local/bin/uv run gunicorn main:app -c gunicorn_conf.py
+User=app
+Group=app
+WorkingDirectory=/opt/myapp/src
+Environment=PATH=/opt/myapp/src/.venv/bin:/usr/bin:/bin
+Environment=WORKERS=2
+Environment=FORWARDED_ALLOW_IPS=127.0.0.1
+Environment=GRACEFUL_TIMEOUT=20
+ExecStart=/opt/myapp/src/docker/scripts/entrypoint.sh serve
+Restart=always
+TimeoutStopSec=30
+KillSignal=SIGTERM
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Habilitar y ejecutar:
-
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable api
-sudo systemctl start api
-sudo systemctl status api
+sudo systemctl enable --now myapp
+journalctl -u myapp -f
 ```
 
-#### 4. Nginx Reverse Proxy
+La app lee el resto de variables desde `/opt/myapp/src/.env`.
 
-Crear `/etc/nginx/sites-available/api`:
+### Nginx
 
-```nginx
-upstream api_backend {
-    server 127.0.0.1:8000;
-}
+Reutilizar `docker/nginx/nginx.conf` y `docker/nginx/conf.d/app.conf`, cambiando el upstream a `server 127.0.0.1:8000;`. Puntos clave de esa configuración:
 
-server {
-    listen 80;
-    server_name api.example.com;
+- `proxy_set_header X-Forwarded-For $remote_addr;` (anti IP spoofing)
+- `proxy_set_header X-Request-ID $request_id;`
+- `limit_req zone=api_per_ip burst=40 nodelay;` (zona de 20 r/s por IP)
+- `location ~ ^/(health|ready)$` sin access log y con `limit_req ... burst=20`
+- `client_max_body_size 10M` igual a `REQUEST_MAX_SIZE_MB`
+- Timeouts de proxy de 60 s
 
-    # Redirigir a HTTPS
-    return 301 https://$server_name$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name api.example.com;
-
-    # SSL
-    ssl_certificate /etc/letsencrypt/live/api.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
-
-    # Configuración SSL
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-
-    # Headers de seguridad
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-
-    # Proxy a API
-    location / {
-        proxy_pass http://api_backend;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Timeouts
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-    }
-
-    # Limitar tamaño de uploads
-    client_max_body_size 10M;
-}
-```
-
-Habilitar sitio:
-
-```bash
-sudo ln -s /etc/nginx/sites-available/api /etc/nginx/sites-enabled/
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-#### 5. SSL con Let's Encrypt
-
-```bash
-sudo apt install certbot python3-certbot-nginx -y
-sudo certbot --nginx -d api.example.com
-sudo certbot renew --dry-run
-```
-
-### Opción 3: Plataformas Cloud
-
-#### Heroku
-
-**Procfile:**
-
-```
-web: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4
-release: alembic upgrade head
-```
-
-**Despliegue:**
-
-```bash
-heroku create mi-api
-heroku addons:create jawsdb:kitefin
-git push heroku main
-```
-
-#### Railway
-
-1. Conectar repositorio de GitHub
-2. Agregar variables de entorno
-3. Railway detecta automáticamente FastAPI
-
-#### Render
-
-1. Crear nuevo Web Service
-2. Build Command: `uv sync`
-3. Start Command: `uv run uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4`
-
-#### AWS (EC2)
-
-Similar a VPS Linux, seguir pasos de "Opción 2".
-
-#### Google Cloud Run
-
-**Dockerfile optimizado:**
-
-```dockerfile
-FROM python:3.13-slim
-
-WORKDIR /app
-COPY . .
-RUN pip install uv && uv sync --no-dev
-
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "$PORT"]
-```
-
-**Despliegue:**
-
-```bash
-gcloud run deploy mi-api \
-  --source . \
-  --platform managed \
-  --region us-central1 \
-  --allow-unauthenticated
-```
-
-## Optimizaciones
-
-### Gunicorn + Uvicorn Workers
-
-```bash
-# Instalar gunicorn
-uv add gunicorn
-
-# Ejecutar
-uv run gunicorn main:app \
-  --workers 4 \
-  --worker-class uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:8000 \
-  --timeout 120
-```
-
-### Caching con Redis
-
-```bash
-uv add redis aiocache
-```
-
-```python
-from aiocache import Cache
-from aiocache.serializers import JsonSerializer
-
-cache = Cache(Cache.REDIS, endpoint="localhost", port=6379, serializer=JsonSerializer())
-
-@cached(ttl=300, cache=cache)
-async def get_expensive_data():
-    # ...
-    pass
-```
-
-### CDN para Estáticos
-
-Si sirves archivos estáticos, usa CDN (CloudFlare, AWS CloudFront, etc.).
-
-### Database Connection Pooling
-
-Ya configurado en `app/core/database.py`:
-
-```python
-self.engine = create_engine(DB_URL,
-    pool_size=10,           # Conexiones permanentes
-    max_overflow=20,        # Conexiones adicionales temporales
-    pool_recycle=180,       # Reciclar conexiones cada 3 min
-    pool_pre_ping=True      # Validar antes de usar
-)
-```
-
-## Monitoreo
-
-### Logs
-
-#### Logging a Archivo
-
-```python
-# app/core/logger.py
-from logging.handlers import RotatingFileHandler
-
-file_handler = RotatingFileHandler(
-    'app.log',
-    maxBytes=10*1024*1024,  # 10 MB
-    backupCount=5
-)
-logger.addHandler(file_handler)
-```
-
-#### Servicios de Logging
-
-- **Sentry**: Tracking de errores
-- **LogRocket**: Session replay + logs
-- **Datadog**: APM + logs
-- **Papertrail**: Agregación de logs
-
-**Sentry:**
-
-```bash
-uv add sentry-sdk[fastapi]
-```
-
-```python
-# main.py
-import sentry_sdk
-from sentry_sdk.integrations.fastapi import FastApiIntegration
-
-if APP_ENV == "production":
-    sentry_sdk.init(
-        dsn="your-sentry-dsn",
-        integrations=[FastApiIntegration()],
-        traces_sample_rate=1.0,
-    )
-```
-
-### Métricas
-
-#### Prometheus
-
-```bash
-uv add prometheus-client
-```
-
-```python
-from prometheus_client import Counter, Histogram, generate_latest
-
-REQUEST_COUNT = Counter('request_count', 'Total requests')
-REQUEST_LATENCY = Histogram('request_latency_seconds', 'Request latency')
-
-@app.middleware("http")
-async def metrics_middleware(request, call_next):
-    REQUEST_COUNT.inc()
-    with REQUEST_LATENCY.time():
-        response = await call_next(request)
-    return response
-
-@app.get("/metrics")
-async def metrics():
-    return Response(generate_latest(), media_type="text/plain")
-```
-
-### Health Checks
-
-```python
-@app.get("/health")
-async def health():
-    # Verificar BD
-    try:
-        db.execute_query("SELECT 1", fetchone=True)
-        db_status = "ok"
-    except:
-        db_status = "error"
-
-    return {
-        "status": "ok" if db_status == "ok" else "degraded",
-        "database": db_status
-    }
-```
-
-## Seguridad
-
-### HTTPS
-
-- **Producción**: Siempre usar HTTPS
-- **Let's Encrypt**: Certificados SSL gratuitos
-- **Nginx**: Configurar SSL correctamente
-
-### Headers de Seguridad
-
-```python
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
-
-if APP_ENV == "production":
-    app.add_middleware(HTTPSRedirectMiddleware)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["api.example.com"])
-```
-
-### CORS
-
-```python
-from fastapi.middleware.cors import CORSMiddleware
-
-origins = ["https://miapp.com"]  # Solo dominios permitidos
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["*"],
-)
-```
-
-### Rate Limiting
-
-```bash
-uv add slowapi
-```
-
-```python
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-@app.get("/")
-@limiter.limit("60/minute")
-async def root(request: Request):
-    return {"message": "Hello World"}
-```
-
-## Backups
-
-### Base de Datos
-
-```bash
-#!/bin/bash
-# backup.sh
-
-DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_DIR="/backups"
-DB_NAME="api_production"
-
-mysqldump -u root -p$DB_PASS $DB_NAME | gzip > $BACKUP_DIR/backup_$DATE.sql.gz
-
-# Mantener solo últimos 7 días
-find $BACKUP_DIR -name "backup_*.sql.gz" -mtime +7 -delete
-```
-
-Agregar a crontab:
-
-```bash
-# Backup diario a las 2 AM
-0 2 * * * /home/api/backup.sh
-```
-
-## Troubleshooting
-
-### Logs de Aplicación
-
-```bash
-# Ver logs del servicio
-sudo journalctl -u api -f
-
-# Ver últimas 100 líneas
-sudo journalctl -u api -n 100
-```
-
-### Reiniciar Servicios
-
-```bash
-# Reiniciar API
-sudo systemctl restart api
-
-# Reiniciar Nginx
-sudo systemctl restart nginx
-
-# Ver estado
-sudo systemctl status api nginx
-```
-
-### Verificar Conexiones
-
-```bash
-# Ver conexiones a puerto 8000
-sudo netstat -tulpn | grep 8000
-
-# Ver procesos de la app
-ps aux | grep uvicorn
-```
-
-## Checklist de Despliegue
-
-- [ ] Variables de entorno configuradas
-- [ ] SECRET_KEY generada de forma segura
-- [ ] Base de datos configurada
-- [ ] Migraciones aplicadas (`alembic upgrade head`)
-- [ ] SSL/HTTPS configurado
-- [ ] Nginx/Reverse proxy configurado
-- [ ] Logs configurados
-- [ ] Monitoreo configurado (Sentry, etc.)
-- [ ] Backups automáticos configurados
-- [ ] Health check endpoint funcionando
-- [ ] Rate limiting configurado
-- [ ] CORS configurado correctamente
-- [ ] Firewall configurado
-- [ ] Dominio apuntando al servidor
-
-## Recursos
-
-- [FastAPI Deployment](https://fastapi.tiangolo.com/deployment/)
-- [Uvicorn Deployment](https://www.uvicorn.org/deployment/)
-- [Nginx Documentation](https://nginx.org/en/docs/)
-- [Let's Encrypt](https://letsencrypt.org/)
+HTTPS: `sudo certbot --nginx -d tudominio.com` o seguir los pasos de [docker-deployment.md](docker-deployment.md#https-con-lets-encrypt).
 
 ---
 
-**¡Tu aplicación está lista para producción!**
+## 7. Backups
+
+```bash
+#!/bin/sh
+# /opt/scripts/backup-db.sh
+set -eu
+DATE=$(date +%Y%m%d_%H%M%S)
+mkdir -p /opt/backups
+mariadb-dump --single-transaction -u app -p"$DB_PASS" app | gzip > "/opt/backups/app_$DATE.sql.gz"
+find /opt/backups -name "app_*.sql.gz" -mtime +7 -delete
+```
+
+```bash
+echo "0 2 * * * root DB_PASS='...' /opt/scripts/backup-db.sh" | sudo tee /etc/cron.d/db-backup
+```
+
+Con Docker ver [Backups en docker-deployment.md](docker-deployment.md#backups).
+
+---
+
+## 8. Checklist de Despliegue
+
+- [ ] `APP_ENV=production`, `SECRET_KEY` de 32+ caracteres, `DB_PASS` fuerte
+- [ ] `ENCRYPTION_KEYS` definida y respaldada fuera de la BD; `ENCODING_ALPHABET` propio (el mismo en todos los despliegues del proyecto)
+- [ ] `SECRET_KEY`, `DB_PASS` y `ENCRYPTION_KEYS` distintos entre sí
+- [ ] `CORS_ORIGINS` con dominios exactos
+- [ ] Docs deshabilitadas o protegidas con `DOCS_PASSWORD_ENABLED=True`
+- [ ] `FORWARDED_ALLOW_IPS` = IP/red del proxy (nunca `*`)
+- [ ] `GRACEFUL_TIMEOUT` < grace period del orquestador
+- [ ] `WORKERS × (DB_POOL_SIZE + DB_MAX_OVERFLOW) × réplicas` < `max_connections`
+- [ ] Rate limit en Redis si hay varios workers/réplicas (o confiar en `limit_req` de nginx)
+- [ ] `REQUEST_MAX_SIZE_MB` = `client_max_body_size` de nginx
+- [ ] Scripts de esquema nuevos (`database/init/`) aplicados una sola vez por despliegue, con backup previo
+- [ ] Liveness en `/health`, readiness en `/ready`
+- [ ] HTTPS habilitado
+- [ ] Logs JSON / agregador y, si aplica, `OTEL_EXPORTER_OTLP_ENDPOINT`
+- [ ] Backups automáticos probados (restaurar al menos una vez)

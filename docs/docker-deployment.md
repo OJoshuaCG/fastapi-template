@@ -1,424 +1,246 @@
-# Guía de Despliegue
+# Despliegue con Docker Compose
 
-Esta guía cubre el despliegue de la aplicación en producción usando **Docker** (método recomendado) o directamente en un servidor Linux.
+Docker + Nginx + MariaDB en un VPS. Los conceptos generales (workers, pool, proxy, health checks) están en [deployment.md](deployment.md).
 
 ---
 
-## Método 1: Docker + Nginx + MariaDB (Recomendado para VPS)
+## Servicios
 
-El método oficial incluye tres servicios orquestados con Docker Compose:
+| Servicio | Imagen | Rol |
+|---|---|---|
+| `db` | `mariadb:11` | Base de datos (red `backend`, volumen `mariadb_data`). Root con contraseña aleatoria (`MARIADB_RANDOM_ROOT_PASSWORD`); `--collation-server=${DB_COLLATION:-utf8mb4_unicode_ci}` |
+| `api` | build local | FastAPI + uvicorn (redes `backend` y `frontend`) |
+| `nginx` | `nginx:alpine` | Reverse proxy, rate limit por IP, gzip, HTTPS (puertos 80/443) |
 
-| Servicio | Imagen         | Descripción                          |
-|----------|----------------|--------------------------------------|
-| `db`     | `mariadb:11`   | Base de datos MariaDB 11             |
-| `api`    | (build local)  | FastAPI + Uvicorn (Python 3.13, uv)  |
-| `nginx`  | `nginx:alpine` | Reverse proxy, SSL, compresión       |
+Orden de arranque:
 
-### Requisitos del VPS
+```
+db (healthy) → api (healthy) → nginx
+```
 
-- Ubuntu/Debian (o cualquier Linux con Docker)
-- Docker Engine 25+ y Docker Compose Plugin 2.24+
-- Puertos 80 y 443 abiertos en el firewall
+La base arranca **vacía**: el compose no ejecuta scripts de esquema y la API no lo modifica. Aplicar `database/init/*.sql` y luego `database/procedures/*.sql` con el gestor de BD o el cliente `mariadb` usando `DB_USER`/`DB_PASS` (ver [Operación](#operación) y [database/README.md](../database/README.md)). El servidor arranca con `--character-set-server=utf8mb4 --collation-server=${DB_COLLATION}`, así la base creada coincide con la collation de la sesión de la app.
+
+La API no está publicada al host (`expose: 8000`): solo nginx la alcanza por la red `frontend` (subred fija `172.28.0.0/24`).
+
+---
+
+## Imagen (`Dockerfile`)
+
+- **Multi-stage**: `builder` instala dependencias con uv (versión fija `0.12.5`, `uv sync --frozen --no-dev`); `production` copia solo `/app` con su `.venv`. La imagen final no tiene uv ni curl.
+- **Usuario sin privilegios** `app` (uid/gid 1000). El código y el `.venv` son de root (no escribibles en runtime); solo `/app/uploads` pertenece a `app`.
+- **Healthcheck en Python puro** contra `http://127.0.0.1:$PORT/health` (cada 30 s, `start-period` 30 s).
+- **Extras opcionales**: `docker build --build-arg UV_EXTRAS="--extra redis" .`
+- `.dockerignore` excluye `.env`, tests, docs, `database/`, archivos de compose y `alembic.ini` (Alembic es opcional; quitarlo de `.dockerignore` si se usan migraciones en el contenedor): los secretos nunca entran a la imagen.
+
+Variables por defecto de la imagen: `PORT=8000`, `WORKERS=1`, `GRACEFUL_TIMEOUT=8`, `FORWARDED_ALLOW_IPS=127.0.0.1`.
+
+### Entrypoint (`docker/scripts/entrypoint.sh`)
+
+| Comando | Qué hace |
+|---|---|
+| `serve` (default) | Inicia uvicorn |
+| `<otro>` | Ejecuta el comando tal cual (`python -V`, `python -c ...`) |
+
+uvicorn queda como PID 1 (`exec`) y recibe `SIGTERM` para el apagado ordenado. Si `WORKERS > 1` sin Redis, el entrypoint avisa que el rate limit en memoria cuenta por worker.
+
+---
+
+## Requisitos del VPS
+
+- Linux con Docker Engine y el plugin Docker Compose v2 (el compose usa `env_file` con `required: false` y `depends_on` con `condition: service_healthy`)
+- Puertos 80 y 443 abiertos
 
 ```bash
-# Instalar Docker en Ubuntu/Debian
-curl -fsSL https://get.docker.com | bash
-sudo usermod -aG docker $USER
-newgrp docker
-
-# Verificar versiones
-docker --version
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER && newgrp docker
 docker compose version
 ```
 
-### 1. Clonar el repositorio
+---
+
+## 1. Clonar y configurar
 
 ```bash
 git clone <tu-repositorio> /opt/myapp
 cd /opt/myapp
-```
-
-### 2. Configurar variables de entorno
-
-```bash
-# Copiar el template de variables Docker
-cp .env.docker.example .env
-
-# Editar con los valores reales
+cp .env.example .env
 nano .env
 ```
 
-Variables **obligatorias** a cambiar:
+Obligatorias en `.env`:
 
-| Variable      | Descripción                                    | Generar con                                         |
-|---------------|------------------------------------------------|-----------------------------------------------------|
-| `SECRET_KEY`  | Clave secreta de la aplicación                 | `python3 -c "import secrets; print(secrets.token_hex(32))"` |
-| `DB_ROOT_PASS`| Contraseña root de MariaDB                     | Contraseña segura aleatoria                         |
-| `DB_PASS`     | Contraseña del usuario de la app en MariaDB    | Contraseña segura aleatoria                         |
-| `CORS_ORIGINS`| Dominios permitidos en producción              | `https://tudominio.com`                             |
+| Variable | Valor |
+|---|---|
+| `APP_ENV` | `production` |
+| `SECRET_KEY` | `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `ENCRYPTION_KEYS` | `uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` (respaldar aparte de la BD) |
+| `ENCODING_ALPHABET` | `uv run python -c "import random, string; a = list(string.ascii_letters + string.digits); random.shuffle(a); print(''.join(a))"` (fijo para siempre) |
+| `DB_NAME`, `DB_USER`, `DB_PASS` | Base y usuario de la app (el contenedor MariaDB los crea; también para gestores de BD) |
+| `CORS_ORIGINS` | `https://tudominio.com` |
 
-> **Nota:** `DB_HOST=db` y `DB_ENGINE=mysql+pymysql` son sobreescritos automáticamente por `docker-compose.yml`. No hace falta cambiarlos.
+El compose falla al iniciar si falta `DB_NAME`, `DB_USER` o `DB_PASS`. Root usa una contraseña aleatoria (`MARIADB_RANDOM_ROOT_PASSWORD`) y no se usa.
 
-### 3. Levantar los servicios
+Fijados por `docker-compose.yml` (no hace falta ponerlos en `.env`):
 
-```bash
-# Construir la imagen y levantar todos los servicios en background
-docker compose up -d --build
+| Servicio | Variable | Valor | Motivo |
+|---|---|---|---|
+| `api` | `DB_HOST` / `DB_PORT` | `db` / `3306` | Nombre del servicio en la red `backend` |
+| `api` | `FORWARDED_ALLOW_IPS` | `172.28.0.0/24` | Solo nginx puede fijar la IP del cliente |
+| `api` | `GRACEFUL_TIMEOUT` | `20` | Menor que `stop_grace_period: 30s` |
 
-# Ver logs en tiempo real
-docker compose logs -f
-
-# Ver logs de un servicio específico
-docker compose logs -f api
-docker compose logs -f db
-docker compose logs -f nginx
-```
-
-La primera vez que se levanta:
-1. MariaDB inicializa la base de datos (~20-30s)
-2. El servicio `api` espera a que MariaDB esté sana
-3. Se aplican las migraciones de Alembic automáticamente
-4. Se inicia Uvicorn
-
-### 4. Verificar el despliegue
-
-```bash
-# Health check de la API (debe responder 200)
-curl http://localhost/health
-
-# Estado de los contenedores
-docker compose ps
-
-# Estadísticas de recursos
-docker stats
-```
-
-### 5. Comandos útiles
-
-```bash
-# Detener servicios (preserva los volúmenes/datos)
-docker compose down
-
-# Detener y eliminar volúmenes (¡BORRA LOS DATOS!)
-docker compose down -v
-
-# Reiniciar un servicio
-docker compose restart api
-
-# Reconstruir solo la imagen de la API (después de cambios en código)
-docker compose up -d --build api
-
-# Ejecutar migraciones manualmente
-docker compose exec api alembic upgrade head
-
-# Ver migraciones aplicadas
-docker compose exec api alembic current
-
-# Acceder a la shell del contenedor API
-docker compose exec api bash
-
-# Acceder a MariaDB directamente
-docker compose exec db mariadb -u root -p
-```
+Opcionales relevantes: `WORKERS`, `RATE_LIMIT_REDIS_ENABLED` / `RATE_LIMIT_REDIS_URL` (requiere la imagen con `UV_EXTRAS="--extra redis"` y un Redis accesible), `LOG_FORMAT=json`.
 
 ---
 
-## Configurar SSL con HTTPS (Let's Encrypt)
-
-### Paso 1: Apuntar el dominio al servidor
-
-Configura un registro DNS tipo `A` apuntando tu dominio a la IP del VPS antes de continuar.
-
-### Paso 2: Instalar Certbot en el host
+## 2. Levantar
 
 ```bash
-sudo apt install certbot -y
+docker compose up -d --build
+docker compose ps
+docker compose logs -f api
+docker compose logs db           # primer arranque: ejecución de database/init/*.sql
 ```
 
-### Paso 3: Obtener el certificado
-
-Con los servicios corriendo (para que el challenge ACME funcione a través de Nginx):
+## 3. Verificar
 
 ```bash
-certbot certonly \
-  --webroot \
-  --webroot-path /var/lib/docker/volumes/$(basename $PWD)_certbot_www/_data \
-  -d tudominio.com \
-  -d www.tudominio.com \
-  --email tu@email.com \
-  --agree-tos \
-  --non-interactive
+curl -i http://localhost/health    # liveness
+curl -i http://localhost/ready     # readiness: 503 si la BD no responde
 ```
 
-### Paso 4: Habilitar HTTPS en Nginx
+Cada respuesta trae `X-Request-ID`; el mismo valor aparece como `rid=` en el log de nginx y como `request_id` en el de la app.
 
-Editar `docker/nginx/conf.d/app.conf`:
+---
 
-1. En el bloque HTTP, reemplazar `location / { ... }` por: `return 301 https://$host$request_uri;`
-2. Descomentar el bloque `server { listen 443 ssl ... }`
-3. Actualizar `server_name` con tu dominio real
-4. Verificar las rutas de `ssl_certificate` y `ssl_certificate_key`
+## Nginx
 
-Recargar Nginx:
+`docker/nginx/nginx.conf` + `docker/nginx/conf.d/app.conf`:
+
+- Upstream `api:8000` con keepalive.
+- **Anti IP spoofing**: `X-Forwarded-For $remote_addr` descarta el header que envíe el cliente. Combinado con `FORWARDED_ALLOW_IPS`, la IP que ve la app es la real.
+- **Rate limit por IP**: zona `api_per_ip` de 20 r/s, `burst=40 nodelay`, responde 429. Compartido entre todos los workers; complementa el rate limit de la app.
+- **Request ID**: `X-Request-ID $request_id` hacia la API.
+- `/health` y `/ready` sin access log y con `limit_req` propio (`burst=20`), para que `/ready` (hace `SELECT 1`) no sirva para martillar la BD.
+- `client_max_body_size 10M` (mantener igual a `REQUEST_MAX_SIZE_MB`).
+- Timeouts de proxy de 60 s; headers de seguridad (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`); gzip; `server_tokens off`.
+
+Recargar tras editar: `docker compose exec nginx nginx -s reload`.
+
+---
+
+## HTTPS con Let's Encrypt
+
+1. Apuntar el dominio (registro `A`) a la IP del VPS.
+2. Instalar Certbot en el host: `sudo apt install certbot -y`.
+3. Con los servicios corriendo, obtener el certificado vía webroot (el volumen `certbot_www` está montado en `/var/www/certbot`):
+
+   ```bash
+   sudo certbot certonly --webroot \
+     -w /var/lib/docker/volumes/$(basename $PWD)_certbot_www/_data \
+     -d tudominio.com -d www.tudominio.com \
+     --email tu@email.com --agree-tos --non-interactive
+   ```
+
+4. Los certificados deben quedar en el volumen `certbot_certs` (montado en `/etc/letsencrypt` del contenedor nginx). Si Certbot los escribe en `/etc/letsencrypt` del host, copiarlos al volumen o cambiar el montaje a un bind mount `/etc/letsencrypt:/etc/letsencrypt:ro`.
+5. En `docker/nginx/conf.d/app.conf`: descomentar el bloque `server { listen 443 ssl ... }`, ajustar `server_name` y rutas de certificados, y en el bloque HTTP reemplazar `location /` por `return 301 https://$host$request_uri;`.
+6. `docker compose exec nginx nginx -s reload`.
+
+Renovación:
 
 ```bash
-docker compose exec nginx nginx -s reload
-```
-
-### Paso 5: Renovación automática
-
-```bash
-# Agregar al crontab del host (renovar cada 12h, recarga Nginx si hay cambios)
 echo "0 */12 * * * root certbot renew --quiet --deploy-hook 'docker compose -f /opt/myapp/docker-compose.yml exec nginx nginx -s reload'" \
   | sudo tee /etc/cron.d/certbot-renew
 ```
 
 ---
 
-## Actualizar la Aplicación
+## Operación
 
 ```bash
-cd /opt/myapp
-
-# Descargar cambios
+# Actualizar a una nueva versión
 git pull
+docker compose up -d --build
 
-# Reconstruir imagen y reiniciar (0 downtime con múltiples réplicas)
-docker compose up -d --build api
+# Aplicar el esquema (BD recién creada: todos los scripts en orden) o un script nuevo
+docker compose exec -T db sh -c 'mariadb -u "$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"' < database/init/002_x.sql
+# Stored procedure nuevo o modificado
+docker compose exec -T db sh -c 'mariadb -u "$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"' < database/procedures/sp_x.sql
 
-# Verificar que la nueva versión está corriendo
-docker compose ps
-curl http://localhost/health
+# Shell y BD
+docker compose exec api sh
+docker compose exec db sh -c 'mariadb -u "$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"'
+
+# Reiniciar / detener
+docker compose restart api
+docker compose down          # conserva volúmenes
+docker compose down -v       # ¡BORRA los datos!
 ```
+
+### Varios workers
+
+Definir `WORKERS` en `.env` y respetar `WORKERS × (DB_POOL_SIZE + DB_MAX_OVERFLOW) < 300` (`--max-connections` de `db`). Para que los límites por ruta de la app se compartan entre workers usar Redis; el límite global por IP es el `limit_req` de nginx, que no depende de los workers.
 
 ---
 
-## Múltiples Workers y Rate Limiting
-
-Por defecto `WORKERS=1`. Con un solo worker, el rate limiting in-memory de SlowAPI funciona correctamente.
-
-Para escalar a múltiples workers, el rate limiting debe usar Redis como backend:
-
-```python
-# app/core/limiter.py
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[RATE_LIMIT_DEFAULT],
-    storage_uri="redis://redis:6379",  # servicio Redis en docker-compose
-)
-```
+## Backups
 
 ```bash
-uv add redis
-```
-
-Ver `docs/features/rate-limiting.md` para más detalles.
-
----
-
-## Backups de Base de Datos
-
-```bash
-#!/bin/bash
+#!/bin/sh
 # /opt/scripts/backup-db.sh
-
+set -eu
+cd /opt/myapp
 DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_DIR="/opt/backups"
-PROJECT_DIR="/opt/myapp"
-
-mkdir -p "$BACKUP_DIR"
-
-docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T db \
-    mariadb-dump -u root -p"${DB_ROOT_PASS}" "${DB_NAME}" \
-    | gzip > "$BACKUP_DIR/backup_$DATE.sql.gz"
-
-# Mantener solo los últimos 7 días
-find "$BACKUP_DIR" -name "backup_*.sql.gz" -mtime +7 -delete
-
-echo "Backup completado: $BACKUP_DIR/backup_$DATE.sql.gz"
+mkdir -p /opt/backups
+docker compose exec -T db sh -c 'mariadb-dump --single-transaction --routines -u "$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"' \
+  | gzip > "/opt/backups/backup_$DATE.sql.gz"
+find /opt/backups -name "backup_*.sql.gz" -mtime +7 -delete
 ```
 
 ```bash
 chmod +x /opt/scripts/backup-db.sh
-
-# Agregar al crontab (backup diario a las 2 AM)
 echo "0 2 * * * root /opt/scripts/backup-db.sh" | sudo tee /etc/cron.d/db-backup
+```
+
+Restaurar:
+
+```bash
+gunzip -c backup_YYYYMMDD_HHMMSS.sql.gz | docker compose exec -T db sh -c 'mariadb -u "$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"'
 ```
 
 ---
 
 ## Troubleshooting
 
-### La API no arranca
+### `api` no arranca / queda esperando
 
 ```bash
-# Ver logs detallados del entrypoint
-docker compose logs api
-
-# Revisar si MariaDB está sana
-docker compose ps db
-docker compose exec db mariadb -u root -p -e "SHOW DATABASES;"
+docker compose ps -a
+docker compose logs db        # api espera a que db esté healthy (service_healthy)
+docker compose logs api       # "Configuración inválida: ..." = revisar .env
 ```
 
-### Error de conexión a la base de datos
+### `/ready` responde 503
 
-Verificar que las variables `DB_USER`, `DB_PASS`, `DB_NAME` en `.env` coincidan exactamente con las de `DB_ROOT_PASS` (MariaDB crea el usuario al iniciar solo si el volumen está vacío).
+La API está viva pero no alcanza la BD: `docker compose logs db`, revisar `DB_*` en `.env`. Si se cambiaron credenciales después del primer arranque, MariaDB conserva las originales del volumen `mariadb_data`.
 
-Si cambiaste credenciales con el volumen existente:
+### `Table '...' doesn't exist`
 
-```bash
-# Eliminar el volumen y recrear (¡BORRA LOS DATOS!)
-docker compose down -v
-docker compose up -d --build
-```
+El volumen `mariadb_data` ya existía, así que `database/init/` no se ejecutó (o falta un script nuevo). Aplicar el script a mano (ver Operación) o, solo en local, `docker compose down -v` para recrear el volumen.
 
-### Nginx devuelve 502 Bad Gateway
+### Nginx devuelve 502
 
-```bash
-# Verificar que la API está corriendo y escuchando
-docker compose exec nginx wget -qO- http://api:8000/health
+`api` no está healthy o no escucha: `docker compose ps`, `docker compose logs api`, `docker compose logs nginx`.
 
-# Ver logs de Nginx
-docker compose logs nginx
-```
+### Todas las requests comparten la misma IP en los logs / rate limit
 
-### Ver variables de entorno del contenedor API
+`FORWARDED_ALLOW_IPS` no coincide con la red de nginx (`172.28.0.0/24`), o se cambió la subred de `frontend` sin actualizarlo.
 
-```bash
-docker compose exec api env | sort
-```
+### 429 inesperados
+
+Revisar si viene de nginx (límite global por IP: 20 r/s, burst 40; sin formato JSON) o de la app (límite por ruta con `rate_limit()`, ej. login con `RATE_LIMIT_LOGIN`; body JSON con `code: "rate_limited"` y header `Retry-After`).
 
 ---
 
-## Método 2: Servidor Linux sin Docker (VPS bare-metal)
+## Checklist
 
-Para despliegues sin Docker, usando `systemd` y Nginx del sistema.
-
-### 1. Instalar dependencias
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install nginx mariadb-server curl -y
-
-# Instalar Python 3.13
-sudo apt install python3.13 python3.13-venv -y
-
-# Instalar uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
-```
-
-### 2. Configurar la aplicación
-
-```bash
-sudo useradd -m -s /bin/bash appuser
-sudo -u appuser bash -c "
-  git clone <repo> /home/appuser/app &&
-  cd /home/appuser/app &&
-  cp .env.example .env &&
-  uv sync --no-dev
-"
-```
-
-### 3. Configurar MariaDB
-
-```bash
-sudo mariadb -e "
-  CREATE DATABASE fastapi_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-  CREATE USER 'fastapi_user'@'localhost' IDENTIFIED BY 'password_seguro';
-  GRANT ALL ON fastapi_db.* TO 'fastapi_user'@'localhost';
-  FLUSH PRIVILEGES;
-"
-```
-
-### 4. Aplicar migraciones
-
-```bash
-sudo -u appuser bash -c "cd /home/appuser/app && uv run alembic upgrade head"
-```
-
-### 5. Servicio systemd
-
-Crear `/etc/systemd/system/fastapi.service`:
-
-```ini
-[Unit]
-Description=FastAPI Application
-After=network.target mariadb.service
-Requires=mariadb.service
-
-[Service]
-Type=exec
-User=appuser
-Group=appuser
-WorkingDirectory=/home/appuser/app
-EnvironmentFile=/home/appuser/app/.env
-ExecStart=/home/appuser/.local/bin/uv run uvicorn main:app \
-    --host 127.0.0.1 \
-    --port 8000 \
-    --workers 1 \
-    --no-access-log \
-    --proxy-headers
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now fastapi
-sudo systemctl status fastapi
-```
-
-### 6. Nginx como reverse proxy
-
-```bash
-sudo tee /etc/nginx/sites-available/fastapi <<'EOF'
-upstream api_backend {
-    server 127.0.0.1:8000;
-}
-
-server {
-    listen 80;
-    server_name tudominio.com;
-
-    client_max_body_size 10M;
-
-    location / {
-        proxy_pass         http://api_backend;
-        proxy_http_version 1.1;
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_set_header   Connection        "";
-    }
-}
-EOF
-
-sudo ln -s /etc/nginx/sites-available/fastapi /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-
-# SSL con Certbot
-sudo apt install certbot python3-certbot-nginx -y
-sudo certbot --nginx -d tudominio.com
-```
-
----
-
-## Checklist de Despliegue
-
-- [ ] `.env` configurado con valores de producción
-- [ ] `SECRET_KEY` generada de forma segura (`secrets.token_hex(32)`)
-- [ ] Contraseñas de DB fuertes y únicas
-- [ ] `DOCS_ENABLED=False` en producción (o ruta protegida)
-- [ ] `CORS_ORIGINS` con dominios exactos (no `*` en producción)
-- [ ] Migraciones aplicadas (`alembic upgrade head`)
-- [ ] Health check respondiendo (`GET /health → 200`)
-- [ ] SSL/HTTPS configurado y funcionando
-- [ ] Certificados con renovación automática
-- [ ] Puertos 80 y 443 abiertos, resto cerrados
-- [ ] Backups automáticos de MariaDB configurados
-- [ ] Logs monitoreados (`docker compose logs -f api`)
+Ver [Checklist de Despliegue](deployment.md#8-checklist-de-despliegue).

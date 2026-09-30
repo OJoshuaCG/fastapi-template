@@ -1,63 +1,62 @@
 # CORS
 
+`CORSMiddleware` de Starlette está en la **app raíz** (`main.py`). Cubre todas las versiones y también `/health` y `/ready`.
+
 ## Configuración
 
 ```env
-CORS_ORIGINS=http://localhost:3000,https://myapp.com
+# Orígenes separados por coma. Vacío = CORS deshabilitado (no se agrega el middleware).
+CORS_ORIGINS=http://localhost:3000,https://app.example.com
 ```
 
-La variable acepta orígenes separados por coma. Se parsea automáticamente en `environments.py`.
+`Settings` separa la lista por comas y quita los espacios. `CORS_ALLOW_CREDENTIALS` vale `True` por defecto; la app usa la propiedad derivada `settings.cors_allow_credentials`, que es `False` si `CORS_ORIGINS` contiene `*`.
 
-```env
-# Desarrollo — permitir todos los orígenes
-CORS_ORIGINS=*
-
-# Producción — orígenes específicos
-CORS_ORIGINS=https://myapp.com,https://admin.myapp.com,https://api.myapp.com
-```
-
-## Configuración Actual
+## Configuración aplicada
 
 ```python
-CORSMiddleware(
-    allow_origins=CORS_ORIGINS,   # Desde variable de entorno
-    allow_credentials=True,        # Permite cookies y headers de auth
-    allow_methods=["*"],           # Todos los métodos HTTP
-    allow_headers=["*"],           # Todos los headers
-)
-```
-
-Para personalizar métodos u headers específicos, editar `create_versioned_app()` en `app/core/versioned_app.py`.
-
-## Advertencia: `*` + `credentials=True`
-
-Los browsers rechazan respuestas con `Access-Control-Allow-Origin: *` cuando la request incluye credenciales (cookies, `Authorization` header). Si tu frontend envía credenciales, **debes definir orígenes específicos**:
-
-```env
-# ❌ No funciona con credenciales en browser
-CORS_ORIGINS=*
-
-# ✓ Funciona con credenciales
-CORS_ORIGINS=http://localhost:3000,https://myapp.com
-```
-
-## Posición en el Stack de Middlewares
-
-CORS es el segundo middleware en ejecutarse (después de `RequestSizeMiddleware`). Esto permite que las requests `OPTIONS` de preflight sean respondidas inmediatamente, antes de que se procesen en middlewares más internos.
-
-## CORS en `/health`
-
-El endpoint `/health` está en el app principal, **no** en la sub-app versionada, por lo que no tiene `CORSMiddleware`. Si necesitas llamar `/health` desde un browser con CORS, agrega el middleware al app principal en `main.py`:
-
-```python
-from fastapi.middleware.cors import CORSMiddleware
-from app.core.environments import CORS_ORIGINS
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
 ```
+
+- `expose_headers` permite que el frontend lea `X-Request-ID` (para reportar errores) y `Retry-After` (rate limit, 503).
+- Si tu frontend envía otros headers, agrégalos a `allow_headers` en `create_app()`.
+
+## `*`
+
+```env
+CORS_ORIGINS=*
+```
+
+- Con `*` se fuerza `allow_credentials=False`. Con `*` y credenciales, Starlette refleja cualquier `Origin`, y eso equivale a acceso abierto con cookies.
+- En `APP_ENV=production`, `*` es **error de configuración** y la app no arranca.
+
+En producción, lista los orígenes exactos.
+
+## Posición en el stack
+
+```
+ContextMiddleware → LoggerMiddleware → CORSMiddleware → rutas / sub-apps
+```
+
+Los preflight `OPTIONS` se responden en CORS, antes de llegar a las sub-apps. Por eso no consumen rate limit ni pasan por el límite de body. Igual quedan en el access log y llevan `X-Request-ID`.
+
+## Verificar
+
+```bash
+curl -i -X OPTIONS http://localhost:8000/api/v1/test/ping \
+  -H "Origin: http://localhost:3000" \
+  -H "Access-Control-Request-Method: POST"
+# access-control-allow-origin: http://localhost:3000
+```
+
+Un origen no listado no recibe `access-control-allow-origin`.
+
+---
+
+Ver también: [Middlewares](middlewares.md)

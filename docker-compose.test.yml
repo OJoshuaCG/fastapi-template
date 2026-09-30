@@ -1,0 +1,27 @@
+# MariaDB para tests (datos en RAM, se descartan al detener).
+#
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   uv run pytest
+#   docker compose -f docker-compose.test.yml down
+services:
+  db-test:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: root_test
+      MARIADB_DATABASE: app_test
+      MARIADB_USER: app_test
+      MARIADB_PASSWORD: app_test_pass
+    command:
+      - --max-connections=200
+      - --log-bin-trust-function-creators=1
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    tmpfs:
+      - /var/lib/mysql
+    ports:
+      - "127.0.0.1:3307:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--su-mysql", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

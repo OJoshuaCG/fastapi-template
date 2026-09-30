@@ -1,182 +1,87 @@
 """
-User Controller - Lógica de Negocio
+UserController: lógica de negocio de usuarios.
 
-Este controller maneja la lógica de negocio relacionada con usuarios.
-Orquesta entre routes y models siguiendo el patrón MVC.
+Recibe sus dependencias (UserModel) por constructor → se inyecta con Depends y se
+reemplaza en tests con dependency_overrides.
 
-Patrón: Routes → Controllers → Models → Database
+Recibe schemas (no dicts armados por la route) y decide cómo persistirlos.
+
+Patrón: Routes → Controllers → (Services) → Models → Database
 """
 
+from typing import Annotated
+
+from fastapi import Depends
+
 from app.exceptions import AppHttpException
-from app.models.user_model import UserModel
+from app.models.user_model import UserModel, UserModelDep
+from app.schemas.user import UserCreate, UserUpdate
+from app.utils.pagination import PaginationParams
+from app.utils.passwords import encrypt_password
 
 
 class UserController:
-    """Controller para operaciones de usuarios"""
+    def __init__(self, users: UserModel):
+        self.users = users
 
-    def __init__(self):
-        self.user_model = UserModel()
-
-    def get_user(self, user_id: int) -> dict:
-        """
-        Obtener usuario por ID
-
-        Args:
-            user_id: ID del usuario
-
-        Returns:
-            dict: Datos del usuario
-
-        Raises:
-            AppHttpException: Si el usuario no existe (404)
-        """
-        user = self.user_model.find_by_id(user_id)
-
+    async def get_user(self, user_id: int) -> dict:
+        user = await self.users.find_by_id(user_id)
         if not user:
             raise AppHttpException(
-                message="Usuario no encontrado",
-                status_code=404,
-                context={"user_id": user_id},
+                "Usuario no encontrado", 404, {"user_id": user_id}, code="user_not_found"
             )
-
         return user
 
-    def get_user_by_username(self, username: str) -> dict:
-        """
-        Obtener usuario por username
+    async def list_users(
+        self, pagination: PaginationParams, *, is_active: bool | None = None
+    ) -> tuple[list[dict], int]:
+        # Dos consultas secuenciales: cada una toma y devuelve su conexión al pool.
+        # No usar asyncio.gather sobre la misma conexión/transacción.
+        items = await self.users.find_all(
+            limit=pagination.size, offset=pagination.offset, is_active=is_active
+        )
+        total = await self.users.count(is_active=is_active)
+        return items, total
 
-        Args:
-            username: Username del usuario
-
-        Returns:
-            dict: Datos del usuario
-
-        Raises:
-            AppHttpException: Si el usuario no existe (404)
-        """
-        user = self.user_model.find_by_username(username)
-
-        if not user:
-            raise AppHttpException(
-                message="Usuario no encontrado",
-                status_code=404,
-                context={"username": username},
-            )
-
-        return user
-
-    def list_users(self, is_active: bool | None = None) -> list[dict]:
-        """
-        Listar todos los usuarios con filtros opcionales
-
-        Args:
-            is_active: Filtrar por estado activo (opcional)
-
-        Returns:
-            list[dict]: Lista de usuarios
-        """
-        return self.user_model.find_all(is_active=is_active)
-
-    def create_user(self, user_data: dict) -> dict:
-        """
-        Crear nuevo usuario con validaciones de negocio
-
-        Args:
-            user_data: Datos del usuario (username, email, hashed_password)
-
-        Returns:
-            dict: Usuario creado
-
-        Raises:
-            AppHttpException: Si el username ya existe (409)
-            AppHttpException: Si el email ya existe (409)
-        """
-        # Validar username único
-        existing_user = self.user_model.find_by_username(user_data["username"])
-        if existing_user:
-            raise AppHttpException(
-                message="El username ya está en uso",
-                status_code=409,
-                context={"username": user_data["username"]},
-            )
-
-        # Validar email único
-        existing_email = self.user_model.find_by_email(user_data.get("email"))
-        if existing_email:
-            raise AppHttpException(
-                message="El email ya está en uso",
-                status_code=409,
-                context={"email": user_data.get("email")},
-            )
-
-        # Crear usuario
-        user_id = self.user_model.create(user_data)
-
-        # Retornar usuario creado
-        return self.user_model.find_by_id(user_id)
-
-    def update_user(self, user_id: int, user_data: dict) -> dict:
-        """
-        Actualizar usuario existente
-
-        Args:
-            user_id: ID del usuario
-            user_data: Datos a actualizar
-
-        Returns:
-            dict: Usuario actualizado
-
-        Raises:
-            AppHttpException: Si el usuario no existe (404)
-            AppHttpException: Si el email ya está en uso (409)
-        """
-        # Validar que el usuario existe
-        self.get_user(user_id)
-
-        # Si se actualiza email, validar que no esté en uso
-        if "email" in user_data:
-            existing_email = self.user_model.find_by_email(user_data["email"])
-            if existing_email and existing_email["id"] != user_id:
+    async def create_user(self, payload: UserCreate) -> dict:
+        data = payload.model_dump(exclude={"password"})
+        data["encrypted_password"] = encrypt_password(payload.password)
+        # Sin "SELECT para ver si existe": eso tiene carrera (TOCTOU).
+        # El índice UNIQUE decide y el 409 llega desde la capa de datos.
+        try:
+            user_id = await self.users.create(data)
+        except AppHttpException as e:
+            if e.reason == "duplicate":
                 raise AppHttpException(
-                    message="El email ya está en uso",
-                    status_code=409,
-                    context={"email": user_data["email"]},
-                )
+                    "El username o email ya está en uso", 409, code="user_conflict"
+                ) from e
+            raise
+        return await self.get_user(user_id)
 
-        # Actualizar usuario
-        self.user_model.update(user_id, user_data)
+    async def update_user(self, user_id: int, payload: UserUpdate) -> dict:
+        data = payload.model_dump(exclude_unset=True)  # PATCH: solo lo enviado
+        try:
+            matched = await self.users.update(user_id, data)
+        except AppHttpException as e:
+            if e.reason == "duplicate":
+                raise AppHttpException("El email ya está en uso", 409, code="user_conflict") from e
+            raise
+        if not matched and data:
+            raise AppHttpException(
+                "Usuario no encontrado", 404, {"user_id": user_id}, code="user_not_found"
+            )
+        return await self.get_user(user_id)
 
-        # Retornar usuario actualizado
-        return self.user_model.find_by_id(user_id)
+    async def delete_user(self, user_id: int) -> None:
+        """Hard delete."""
+        if not await self.users.delete(user_id):
+            raise AppHttpException(
+                "Usuario no encontrado", 404, {"user_id": user_id}, code="user_not_found"
+            )
 
-    def delete_user(self, user_id: int) -> None:
-        """
-        Eliminar usuario (soft delete - marcar como inactivo)
 
-        Args:
-            user_id: ID del usuario
+def get_user_controller(users: UserModelDep) -> UserController:
+    return UserController(users)
 
-        Raises:
-            AppHttpException: Si el usuario no existe (404)
-        """
-        # Validar que el usuario existe
-        self.get_user(user_id)
 
-        # Marcar como inactivo (soft delete)
-        self.user_model.update(user_id, {"is_active": False})
-
-    def hard_delete_user(self, user_id: int) -> None:
-        """
-        Eliminar usuario permanentemente (hard delete)
-
-        Args:
-            user_id: ID del usuario
-
-        Raises:
-            AppHttpException: Si el usuario no existe (404)
-        """
-        # Validar que el usuario existe
-        self.get_user(user_id)
-
-        # Eliminar permanentemente
-        self.user_model.delete(user_id)
+UserControllerDep = Annotated[UserController, Depends(get_user_controller)]

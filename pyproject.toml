@@ -1,19 +1,88 @@
 [project]
 name = "fastapi-template"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+version = "0.2.0"
+description = "Plantilla FastAPI async (MariaDB/MySQL) con sub-apps versionadas"
+readme = "readme.md"
 requires-python = ">=3.13"
 dependencies = [
-    "alembic>=1.14.0",
-    "detect-secrets>=1.5.0",
-    "dotenv>=0.9.9",
-    "fastapi[standard]>=0.123.4",
-    "itsdangerous>=2.2.0",
-    "pymysql>=1.1.2",
-    "slowapi>=0.1.9",
-    "sqlalchemy>=2.0.46",
+    "asyncmy>=0.2.15",
+    "cryptography>=46",
+    "fastapi[standard]>=0.142.2",
+    "httpx>=0.28.1",
+    "limits>=5.8.0",
+    "pydantic>=2.13.0",
+    "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.1",
+    "sqids>=0.5",
+    "sqlalchemy[asyncio]>=2.1.1",
+    "starlette>=1.7.0",
+    "uvicorn[standard]>=0.54.0",
 ]
 
+[project.optional-dependencies]
+# Contadores de rate limit compartidos entre workers
+redis = ["redis>=5.2"]
+
 [dependency-groups]
-dev = []
+dev = [
+    "asgi-lifespan>=2.1.0",
+    "detect-secrets>=1.5.0",
+    "httpx2>=2.13.1",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.4.0",
+    "redis>=5.2",
+    "ruff>=0.16.0",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FastAPI CLI: `uv run fastapi dev` (desarrollo) / `uv run fastapi run`
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.fastapi]
+entrypoint = "main:app"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ruff
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+# ASYNC: detecta llamadas bloqueantes dentro de `async def` (time.sleep, open, requests…)
+# RUF006: create_task sin guardar referencia · B: defaults mutables · S: bandit (SQL injection, secretos)
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC", "RUF"]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # caracteres ambiguos: los textos están en español
+]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Body",
+    "fastapi.File", "fastapi.Form", "fastapi.Header", "fastapi.Security",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pytest
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+addopts = "-ra --strict-markers"
+markers = ["db: requiere MariaDB (docker compose -f docker-compose.test.yml up -d --wait)"]
+filterwarnings = [
+    # Una corrutina sin await es un bug: que el test falle
+    "error::RuntimeWarning",
+    # Cualquier deprecación hace fallar los tests. FastAPI/Starlette/uvicorn usan categorías propias
+    # (heredan de UserWarning, no de DeprecationWarning)
+    "error::DeprecationWarning",
+    "error::PendingDeprecationWarning",
+    "error::fastapi.exceptions.FastAPIDeprecationWarning",
+    "error::starlette.exceptions.StarletteDeprecationWarning",
+    "error::uvicorn.config.UvicornDeprecationWarning",
+]

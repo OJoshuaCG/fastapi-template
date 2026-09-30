@@ -1,482 +1,119 @@
-# Sistema de Logging
+# Logging
 
-El proyecto incluye un sistema de logging centralizado y configurable que facilita el debugging y monitoreo de la aplicación.
+Se usa `logging` estándar de Python. `configure_logging(settings)` (`app/core/logging_config.py`) lo configura una sola vez, al crear la app en `main.py`.
 
-## Arquitectura
-
-El sistema de logging está compuesto por:
-
-1. **`app/core/logger.py`**: Módulo central de logging
-2. **`app/middleware/LoggerMiddleware.py`**: Middleware para logging automático de requests/responses
-3. **Variables de entorno**: Configuración del comportamiento
-
-## Configuración
-
-### Variables de Entorno
-
-En `.env`:
-
-```env
-# Nivel de logging (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-LOGGER_LEVEL=INFO
-
-# Habilitar middleware de logging
-LOGGER_MIDDLEWARE_ENABLED=True
-
-# Mostrar headers en logs (útil para debugging, desactivar en producción)
-LOGGER_MIDDLEWARE_SHOW_HEADERS=False
-
-# Mostrar query params en logs (?page=1&size=10)
-LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS=True
-
-# Mostrar body del request en logs
-LOGGER_MIDDLEWARE_SHOW_BODY=True
-
-# True = loggea path real (/users/42). False = loggea template (/users/{user_id})
-LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS=True
-
-# Habilitar logging de excepciones
-LOGGER_EXCEPTIONS_ENABLED=True
-```
-
-| Variable | Default | Descripción |
-|---|---|---|
-| `LOGGER_LEVEL` | `INFO` | Nivel mínimo de logs |
-| `LOGGER_MIDDLEWARE_ENABLED` | `True` | Activar/desactivar el middleware |
-| `LOGGER_MIDDLEWARE_SHOW_HEADERS` | `False` | Incluir headers en logs |
-| `LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS` | `True` | Mostrar query params |
-| `LOGGER_MIDDLEWARE_SHOW_BODY` | `True` | Mostrar body del request |
-| `LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS` | `True` | `False` = usar template de ruta |
-| `LOGGER_EXCEPTIONS_ENABLED` | `True` | Loggear excepciones |
-
-### Niveles de Logging
-
-| Nivel    | Uso                                       | Ejemplo                                      |
-|----------|-------------------------------------------|----------------------------------------------|
-| DEBUG    | Información detallada para debugging      | Valores de variables, estados internos       |
-| INFO     | Confirmación de operaciones normales      | "Usuario creado", "Request procesado"        |
-| WARNING  | Situación inusual pero manejable          | "Intento de login fallido", "Cache miss"     |
-| ERROR    | Error que impide completar una operación  | "Error en BD", "API externa no responde"     |
-| CRITICAL | Error crítico que puede detener la app    | "BD inaccesible", "Memoria agotada"          |
-
-## Uso Básico
-
-### Importar Logger
+## Uso
 
 ```python
-from app.core.logger import get_logger
-
-# Logger con nombre del módulo
-logger = get_logger(__name__)
-
-# Logger con nombre personalizado
-logger = get_logger("my_custom_logger")
-
-# Logger con nivel específico
-logger = get_logger(__name__, level="DEBUG")
-```
-
-### Logging en Endpoints
-
-```python
-from fastapi import APIRouter
-from app.core.logger import get_logger
-
-router = APIRouter()
-logger = get_logger(__name__)
-
-@router.post("/users")
-async def create_user(user: UserCreate):
-    logger.info(f"Creando usuario: {user.username}")
-
-    try:
-        # Lógica de creación
-        logger.debug(f"Datos del usuario: {user.dict()}")
-        new_user = create_user_in_db(user)
-        logger.info(f"Usuario creado exitosamente: ID {new_user.id}")
-        return new_user
-    except Exception as e:
-        logger.error(f"Error al crear usuario: {str(e)}")
-        raise
-```
-
-### Logging con Contexto
-
-Usa el Request ID para correlacionar logs:
-
-```python
-from app.core.context import current_http_identifier
-from app.core.logger import get_logger
-
-logger = get_logger(__name__)
-
-@router.get("/users/{user_id}")
-async def get_user(user_id: int):
-    request_id = current_http_identifier.get()
-    logger.info(f"{request_id} | Obteniendo usuario ID {user_id}")
-
-    # ...
-
-    logger.info(f"{request_id} | Usuario encontrado: {user.username}")
-    return user
-```
-
-## Logger Middleware
-
-El `LoggerMiddleware` registra automáticamente todas las requests y responses.
-
-### Funcionamiento
-
-1. **Request**: Registra método, path, query params, body, headers (opcional)
-2. **Response**: Registra status code, tiempo de procesamiento
-3. **Request ID**: Usa el ID generado por `ContextMiddleware` para correlación
-
-### Ejemplo de Logs
-
-Con `LOGGER_MIDDLEWARE_ENABLED=True`:
-
-```
-2026-02-11 10:30:15 [INFO] a1b2c3d4e5f6g7h8 | Host: 127.0.0.1 | Request: POST /users | Body: {'username': 'john', 'email': 'john@example.com'} | Query: <no parameters>
-2026-02-11 10:30:15 [INFO] a1b2c3d4e5f6g7h8 | Host: 127.0.0.1 | Response: POST /users | Status: 201 | Duration: 0.156s
-```
-
-### Ocultar Información Sensible
-
-El middleware oculta automáticamente el body en rutas sensibles:
-
-```python
-# app/middleware/LoggerMiddleware.py
-logger_info_request = [
-    str(unique_id),
-    f"Host: {client_ip}",
-    f"Request: {method} {path}",
-    f"Body: {'<cannot show>' if path in ['/user/login'] else body}",
-    f"Query: {query_string if query_string else '<no parameters>'}",
-]
-```
-
-**Personalizar rutas sensibles:**
-
-```python
-# Agregar más rutas a la lista
-SENSITIVE_ROUTES = ['/user/login', '/auth/register', '/password/reset']
-
-f"Body: {'<cannot show>' if path in SENSITIVE_ROUTES else body}",
-```
-
-### Mostrar Headers
-
-Para debugging, puedes habilitar logging de headers:
-
-```env
-LOGGER_MIDDLEWARE_SHOW_HEADERS=True
-```
-
-**Advertencia**: Desactiva esto en producción para evitar logging de tokens de autenticación.
-
-## Logging de Excepciones
-
-### Configuración
-
-```env
-LOGGER_EXCEPTIONS_ENABLED=True
-```
-
-### Excepciones Controladas (AppHttpException)
-
-```python
-from app.exceptions import AppHttpException
-
-raise AppHttpException(
-    message="Usuario no encontrado",
-    status_code=404,
-    context={"user_id": user_id}
-)
-```
-
-**Log generado (WARNING):**
-
-```
-2026-02-11 10:35:20 [WARNING] a1b2c3d4e5f6g7h8 | Exception: AppHttpException | Message: Usuario no encontrado | Status Code: 404 | Context: {'user_id': 123} | Loc: {'file': 'app/routes/users.py', 'function': 'get_user', 'line': 45, 'code': 'raise AppHttpException(...)'}
-```
-
-### Excepciones No Controladas
-
-```python
-# Error inesperado
-result = 10 / 0  # ZeroDivisionError
-```
-
-**Log generado (ERROR):**
-
-```
-2026-02-11 10:36:00 [ERROR] a1b2c3d4e5f6g7h8 | Exception: ZeroDivisionError | Message: UNHANDLED EXC. "division by zero" | File: app/routes/users.py | Function: calculate_stats | Line: 78 | Code: "result = 10 / 0"
-```
-
-## Buenas Prácticas
-
-### 1. Usar el Nivel Apropiado
-
-```python
-# ✅ Correcto
-logger.info("Usuario creado exitosamente")
-logger.warning("Intento de acceso no autorizado")
-logger.error("Error en conexión a base de datos")
-
-# ❌ Incorrecto
-logger.info("Error crítico en la aplicación")  # Debería ser ERROR o CRITICAL
-logger.error("Procesando request normal")      # Debería ser INFO o DEBUG
-```
-
-### 2. Incluir Contexto Útil
-
-```python
-# ✅ Correcto
-logger.error(f"Error al obtener usuario ID {user_id}: {str(e)}")
-
-# ❌ Incorrecto
-logger.error("Error")  # No proporciona información útil
-```
-
-### 3. Usar Request ID para Correlación
-
-```python
-# ✅ Correcto
-request_id = current_http_identifier.get()
-logger.info(f"{request_id} | Procesando pago para usuario {user_id}")
-logger.info(f"{request_id} | Pago completado: ${amount}")
-
-# Ahora puedes buscar todos los logs de esta request con el Request ID
-```
-
-### 4. No Loggear Información Sensible
-
-```python
-# ❌ NUNCA hacer esto
-logger.info(f"Usuario login: {username}, password: {password}")
-logger.debug(f"Token: {auth_token}")
-
-# ✅ Correcto
-logger.info(f"Usuario login: {username}")
-logger.debug("Token generado exitosamente")
-```
-
-### 5. Logging en Desarrollo vs Producción
-
-```python
-from app.core.environments import APP_ENV
-
-if APP_ENV == "development":
-    logger.debug(f"Query SQL: {query}")
-    logger.debug(f"Parámetros: {params}")
-else:
-    # En producción, solo loggear información relevante
-    logger.info("Query ejecutado exitosamente")
-```
-
-### 6. Usar f-strings para Performance
-
-```python
-# ✅ Mejor performance (f-string se evalúa solo si el nivel está activo)
-logger.debug(f"Datos del usuario: {user.dict()}")
-
-# ❌ Peor performance (string concatenation siempre se ejecuta)
-logger.debug("Datos del usuario: " + str(user.dict()))
-```
-
-## Configuración Avanzada
-
-### Logger Personalizado con Archivo
-
-Si necesitas guardar logs en archivos:
-
-```python
-# app/core/logger.py
 import logging
-from logging.handlers import RotatingFileHandler
 
-def get_logger(name=None, level=None, log_file=None):
-    logger_name = name or APP_NAME
-    logger_level = level or LOGGER_LEVEL
+logger = logging.getLogger(__name__)
 
-    logger = logging.getLogger(logger_name)
-    logger.setLevel(logger_level)
-    logger.propagate = False
-
-    if not logger.hasHandlers():
-        # Handler de consola
-        console_handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-
-        # Handler de archivo (opcional)
-        if log_file:
-            file_handler = RotatingFileHandler(
-                log_file,
-                maxBytes=10*1024*1024,  # 10 MB
-                backupCount=5
-            )
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
-
-    return logger
+logger.info("Pedido %s confirmado", order_id)      # el request_id se agrega solo
+logger.warning("Reintento %d de %d", attempt, max_attempts)
+logger.exception("Falló la sincronización")        # dentro de un except: incluye traceback
 ```
 
-Uso:
+- Usa `logging.getLogger(__name__)` dentro del paquete `app`. El handler está configurado en el logger `app` (con `propagate=False`), así que cubre `app.*`. El logger raíz usa el mismo handler a nivel `WARNING`: los warnings de librerías (sqlalchemy, httpx, limits...) salen con el mismo formato (JSON consistente).
+- Usa argumentos `%s` en vez de f-strings: el mensaje solo se formatea si el nivel está activo.
+- No agregues el request id a mano: `RequestContextFilter` lo inyecta en cada línea desde el ContextVar (`-` fuera de una request).
 
-```python
-logger = get_logger(__name__, log_file="app.log")
-```
-
-### Integración con Servicios Externos
-
-#### Sentry (Recomendado para producción)
-
-```bash
-uv add sentry-sdk[fastapi]
-```
-
-```python
-# main.py
-import sentry_sdk
-from sentry_sdk.integrations.fastapi import FastApiIntegration
-from app.core.environments import APP_ENV
-
-if APP_ENV == "production":
-    sentry_sdk.init(
-        dsn="your-sentry-dsn",
-        integrations=[FastApiIntegration()],
-        traces_sample_rate=1.0,
-    )
-```
-
-#### LogRocket, Datadog, etc.
-
-Similar al ejemplo de Sentry, sigue la documentación de cada servicio.
-
-## Debugging con Logs
-
-### Ver Logs en Tiempo Real
-
-```bash
-# Ejecutar aplicación y ver logs
-uv run uvicorn main:app --reload
-
-# Filtrar por nivel
-uv run uvicorn main:app --reload | grep ERROR
-
-# Buscar por Request ID
-uv run uvicorn main:app --reload | grep a1b2c3d4e5f6g7h8
-```
-
-### Buscar Logs de una Request Específica
-
-1. Cliente recibe error con `X-Request-ID` header
-2. Buscar en logs por ese Request ID
-3. Ver toda la cadena de logs de esa request
-
-```bash
-# Buscar todos los logs de un Request ID
-cat app.log | grep a1b2c3d4e5f6g7h8
-```
-
-## Solución de Problemas
-
-### Logs Duplicados
-
-**Problema**: Cada log aparece dos veces.
-
-**Causa**: `logger.propagate = True` (comportamiento por defecto de Python).
-
-**Solución**: Ya implementado en `get_logger()`:
-
-```python
-logger.propagate = False  # Evita duplicación
-```
-
-### Logs No Aparecen
-
-**Problema**: No se ven logs en consola.
-
-**Causa**: Nivel de logging muy alto.
-
-**Solución**:
+## Formatos
 
 ```env
-# Cambiar en .env
-LOGGER_LEVEL=DEBUG  # Muestra todos los logs
+LOGGER_LEVEL=INFO        # DEBUG | INFO | WARNING | ERROR | CRITICAL
+LOG_FORMAT=text          # text | json
 ```
 
-### Demasiados Logs
+**text** (default):
 
-**Problema**: Logs saturan la consola.
-
-**Solución**:
-
-```env
-# Producción
-LOGGER_LEVEL=WARNING
-LOGGER_MIDDLEWARE_ENABLED=False  # Desactivar logging automático de requests
+```
+2026-09-29 10:30:15,123 [INFO] app.access [a1b2c3d4e5f6a7b8] 10.0.0.5 | GET /api/v1/users/15 | 200 | 4.2ms
 ```
 
-## Ejemplos Completos
+**json**, una línea por evento, para Loki/ELK/Datadog:
 
-### Endpoint con Logging Completo
+```json
+{"ts": "2026-09-29T10:30:15.123456+00:00", "level": "INFO", "logger": "app.access", "msg": "10.0.0.5 | GET /api/v1/users/15 | 200 | 4.2ms", "request_id": "a1b2c3d4e5f6a7b8"}
+```
+
+En JSON se agregan `user_id` (si `current_user_id` está establecido), `exc` (traceback) y cualquier campo pasado con `extra=`:
 
 ```python
-from fastapi import APIRouter, HTTPException
-from app.core.logger import get_logger
-from app.core.context import current_http_identifier
-from app.exceptions import AppHttpException
-
-router = APIRouter(prefix="/users", tags=["Users"])
-logger = get_logger(__name__)
-
-@router.get("/{user_id}")
-async def get_user(user_id: int):
-    request_id = current_http_identifier.get()
-
-    logger.info(f"{request_id} | Obteniendo usuario ID {user_id}")
-
-    try:
-        # Buscar usuario en BD
-        logger.debug(f"{request_id} | Ejecutando query para usuario {user_id}")
-        user = db.execute_query(
-            "SELECT * FROM users WHERE id = :id",
-            {"id": user_id},
-            fetchone=True
-        )
-
-        if not user:
-            logger.warning(f"{request_id} | Usuario {user_id} no encontrado")
-            raise AppHttpException(
-                message="Usuario no encontrado",
-                status_code=404,
-                context={"user_id": user_id}
-            )
-
-        logger.info(f"{request_id} | Usuario encontrado: {user['username']}")
-        return user
-
-    except AppHttpException:
-        raise
-    except Exception as e:
-        logger.error(f"{request_id} | Error inesperado al obtener usuario: {str(e)}")
-        raise AppHttpException(
-            message="Error interno del servidor",
-            status_code=500,
-            context={"error": str(e)}
-        )
+logger.info("Pago aprobado", extra={"order_id": 42, "amount": 1500})
 ```
 
-## Recursos
+## Access log (`LoggerMiddleware`)
 
-- [Documentación de logging de Python](https://docs.python.org/3/library/logging.html)
-- [Context Management](context.md) - Para usar Request ID
-- [Manejo de Excepciones](exceptions.md) - Para logging de errores
-- [Middlewares](middlewares.md) - LoggerMiddleware
+Middleware ASGI puro en la app raíz (logger `app.access`). Escribe **una línea por request**:
+
+```
+<ip> | <MÉTODO> <path> | <status> | <duración>ms [| query: ...] [| headers: ...]
+```
+
+- Nivel según el status: 5xx `ERROR`, 4xx `WARNING`, resto `INFO`.
+- `/health` y `/ready` no se registran.
+- **El body nunca se registra.** Los bodies traen contraseñas, tokens y datos personales, y cualquier lista de "campos sensibles" termina quedándose atrás.
+- Query params: los valores de claves sensibles (`token`, `password`, `api_key`, `secret`...) se enmascaran (`token=%2A%2A%2A`).
+- Headers: `Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization` y `X-Api-Key` siempre se muestran como `***`, además de cualquier header cuyo nombre coincida con una clave sensible (`is_sensitive_key`: `token`, `secret`, `password`, `api_key`...).
+
+```env
+LOGGER_MIDDLEWARE_ENABLED=True             # False = no se agrega el middleware
+LOGGER_MIDDLEWARE_SHOW_HEADERS=False
+LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS=True
+LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS=True    # True = /api/v1/users/15 · False = /api/v1/users/{user_id}
+LOGGER_MIDDLEWARE_ERRORS_ONLY=False        # True = solo registra requests con status >= 400
+```
+
+El detalle de un error (mensaje, `context`, traceback) no lo escribe el access log: lo escriben los exception handlers.
+
+## Logs de errores
+
+```env
+# Registrar también los errores controlados 4xx (los 5xx siempre se registran)
+LOGGER_EXCEPTIONS_ENABLED=False
+```
+
+- `AppHttpException` ≥ 500 y excepciones no controladas: siempre se registran. Las `AppHttpException` con `code`, `reason` y `context` sanitizado; las no controladas con traceback y `archivo:línea en función()` del proyecto, una sola vez.
+- `AppHttpException` 4xx y 422 de validación: solo con `LOGGER_EXCEPTIONS_ENABLED=True`.
+
+Ver [Manejo de Excepciones](exceptions.md#logging-de-errores).
+
+## uvicorn
+
+- **Access log de uvicorn** (`uvicorn.access`): el template no lo filtra. En Docker uvicorn corre con `--no-access-log` (el access log es `app.access`, que ya excluye `/health` y `/ready`); en local puedes pasar el mismo flag.
+- **`uvicorn.error`**: se descarta el `Exception in ASGI application` de las excepciones que ya registró el handler de 500, para no duplicar el traceback.
+
+## Otros logs del template
+
+| Logger | Qué registra |
+|---|---|
+| `app.lifespan` | Arranque/apagado: cliente HTTP, BD, advertencias de configuración (`startup_warnings`). |
+| `app.core.rate_limit` | Warning si el storage del rate limit (Redis) no responde o está mal configurado. |
+| `app.routes.health` | Warning con la causa cuando `/ready` responde 503. |
+| `app.exceptions.HandlerExceptions` | Errores (ver arriba). |
+
+## Buscar por request
+
+El `request_id` aparece en cada línea, en el header `X-Request-ID` y en `detail.request_id` de cada error. Con nginx delante es el mismo `$request_id` del log de nginx.
+
+```bash
+docker compose logs api | grep a1b2c3d4e5f6a7b8
+```
+
+## Qué no loguear
+
+- Bodies, contraseñas, tokens, headers de autenticación, datos personales completos.
+- `str(e)` de errores de BD en mensajes al cliente (en logs sí, vía `context`).
+
+`sanitize()` de `app/utils/dict_utils.py` enmascara recursivamente las claves sensibles de un dict antes de loguearlo:
+
+```python
+from app.utils.dict_utils import sanitize
+
+logger.info("Payload a proveedor: %s", sanitize(payload))
+```
 
 ---
 
-**Siguiente**: [Context Management](context.md)
+Ver también: [Contexto de Request](context.md) · [Middlewares](middlewares.md)

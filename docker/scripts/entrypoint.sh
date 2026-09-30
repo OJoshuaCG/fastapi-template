@@ -1,75 +1,44 @@
-#!/bin/bash
-set -euo pipefail
-
+#!/bin/sh
 # ─────────────────────────────────────────────────────────────────────────────
-# Función: esperar a que MariaDB esté lista para conexiones
-# Aunque el healthcheck de Docker Compose ya lo verifica, puede existir una
-# pequeña ventana donde el usuario aún no tiene permisos. Reintentamos aquí.
+# Entrypoint del contenedor
+#
+#   serve    (default) inicia la API.
+#   <otro>   ejecuta el comando tal cual (ej: docker compose run --rm api python -V)
+#
+# El esquema de la BD se administra con scripts SQL en database/ (ver database/README.md).
 # ─────────────────────────────────────────────────────────────────────────────
-wait_for_db() {
-    local max_retries=15
-    local retry=0
+set -eu
 
-    echo "[entrypoint] Esperando conexión a MariaDB (${DB_HOST}:${DB_PORT:-3306})..."
+serve() {
+    workers="${WORKERS:-1}"
 
-    until python - <<'PYEOF' 2>/dev/null
-import pymysql, os, sys
-try:
-    conn = pymysql.connect(
-        host=os.getenv("DB_HOST", "db"),
-        port=int(os.getenv("DB_PORT", "3306")),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASS"),
-        database=os.getenv("DB_NAME"),
-        connect_timeout=3,
-    )
-    conn.close()
-except Exception as e:
-    print(f"  No disponible: {e}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-    do
-        retry=$((retry + 1))
-        if [ "$retry" -ge "$max_retries" ]; then
-            echo "[entrypoint] ERROR: No se pudo conectar a MariaDB después de $max_retries intentos."
-            exit 1
-        fi
-        echo "[entrypoint] MariaDB no lista (intento $retry/$max_retries). Reintentando en 3s..."
-        sleep 3
-    done
+    if [ "$workers" -gt 1 ] && [ "${RATE_LIMIT_REDIS_ENABLED:-False}" != "True" ] \
+        && [ "${RATE_LIMIT_REDIS_ENABLED:-false}" != "true" ]; then
+        echo "[entrypoint] AVISO: $workers workers con rate limit en memoria: cada worker cuenta por separado."
+    fi
 
-    echo "[entrypoint] Conexión a MariaDB establecida."
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Función: aplicar migraciones Alembic
-# ─────────────────────────────────────────────────────────────────────────────
-run_migrations() {
-    echo "[entrypoint] Aplicando migraciones Alembic..."
-    alembic upgrade head
-    echo "[entrypoint] Migraciones aplicadas correctamente."
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Función: iniciar la aplicación FastAPI con Uvicorn
-# WORKERS=1 por defecto. Con múltiples workers, configurar Redis para rate limiting.
-# Ver: docs/features/rate-limiting.md
-# ─────────────────────────────────────────────────────────────────────────────
-start_app() {
-    local workers="${WORKERS:-1}"
-    echo "[entrypoint] Iniciando FastAPI con $workers worker(s)..."
+    echo "[entrypoint] Iniciando API con $workers worker(s)..."
+    # exec: uvicorn queda como PID 1 y recibe SIGTERM para el apagado ordenado.
+    # --forwarded-allow-ips: SOLO la IP/red del proxy. Con "*" cualquier cliente podría
+    #   falsificar su IP con X-Forwarded-For (y saltarse el rate limit).
+    # --timeout-graceful-shutdown: debe ser menor que el grace period del orquestador
+    #   (stop_grace_period en compose) para que el lifespan alcance a cerrar el pool.
     exec uvicorn main:app \
         --host 0.0.0.0 \
-        --port 8000 \
+        --port "${PORT:-8000}" \
         --workers "$workers" \
-        --no-access-log \
         --proxy-headers \
-        --forwarded-allow-ips "*"
+        --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-127.0.0.1}" \
+        --timeout-graceful-shutdown "${GRACEFUL_TIMEOUT:-8}" \
+        --no-access-log \
+        --no-server-header
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-wait_for_db
-run_migrations
-start_app
+case "${1:-serve}" in
+    serve)
+        serve
+        ;;
+    *)
+        exec "$@"
+        ;;
+esac

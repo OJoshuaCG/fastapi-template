@@ -1,554 +1,578 @@
 # FastAPI Template - Guía para Agentes de IA
 
-Este documento proporciona contexto y guías para agentes de IA que trabajen en este proyecto.
+Plantilla base para nuevos proyectos FastAPI: **async de punta a punta**, MariaDB/MySQL,
+sub-apps versionadas, formato de respuesta y de error estándar, tests contra BD real.
 
-## Descripción del Proyecto
+## Regla número uno: nada bloqueante dentro de `async def`
 
-**Template de FastAPI** diseñado para ser la base de nuevos proyectos. Incluye configuración robusta, mejores prácticas y herramientas esenciales para desarrollo profesional.
+Un `async def` que llama algo síncrono (driver de BD síncrono, `requests`, `time.sleep`,
+`open()` de archivos grandes, CPU pesado) **congela el worker entero**: ninguna otra request
+—ni `/health`— se atiende mientras dura. Por eso:
 
-### Arquitectura: Pseudo-MVC (Sin Vista)
+- BD: siempre `await db.fetch_one(...)` etc. (`app/core/database.py`, driver asyncmy).
+- HTTP saliente: un service que hereda de `ServiceClient` (`app/services/`). Nunca `requests`.
+- Archivos: `anyio.Path` / `anyio.open_file`.
+- CPU o librerías síncronas: `await anyio.to_thread.run_sync(fn, ...)`.
+- `asyncio.create_task(...)`: guardar la referencia (Ruff RUF006 lo detecta).
+- Ruff con reglas `ASYNC` detecta llamadas bloqueantes; pytest falla con corrutinas sin `await`.
+- Para diagnosticar bloqueos: `PYTHONASYNCIODEBUG=1` en desarrollo, `py-spy dump` en producción
+  (ver `docs/development/best-practices.md`).
 
-**Routes → Controllers → Models → Database**
+## Arquitectura
 
-- **Routes** (`app/routes/`): Definen endpoints, validan entrada con Pydantic schemas
-- **Controllers** (`app/controllers/`): Lógica de negocio y orquestación
-- **Models** (`app/models/`): Interacción con base de datos (SQL directo o ORM)
-
-### Arquitectura de API Versioning
-
-Cada versión de API es una **sub-app FastAPI independiente** montada en el app principal:
-
-```
-main.py (FastAPI principal)
-  ├── GET /health          ← en el app principal, sin middlewares de versión
-  ├── /api/v1 → v1_app    ← sub-app con su propio stack de middlewares
-  └── /api/v2 → v2_app    ← sub-app independiente (a futuro)
-```
-
-`create_versioned_app()` en `app/core/versioned_app.py` crea sub-apps con todo configurado: middlewares, handlers de excepciones, rate limiting, CORS, documentación.
-
-## Estructura de Carpetas
+**Routes → Controllers → (Services) → Models → Database**
 
 ```
-fastapi-template/
-├── app/
-│   ├── core/
-│   │   ├── environments.py     # Todas las variables de entorno
-│   │   ├── logger.py           # Sistema de logging centralizado
-│   │   ├── context.py          # ContextVars de request (Request ID, IP, etc.)
-│   │   ├── database.py         # Gestión de conexiones (pool SQLAlchemy)
-│   │   ├── limiter.py          # Singleton Limiter de SlowAPI
-│   │   └── versioned_app.py    # Factory create_versioned_app()
-│   ├── controllers/            # Lógica de negocio (MVC)
-│   ├── exceptions/
-│   │   ├── AppHttpException.py # Excepción personalizada con tracking
-│   │   ├── HandlerExceptions.py# Handlers globales de excepciones
-│   │   └── __init__.py
-│   ├── middleware/
-│   │   ├── ContextMiddleware.py    # Request ID + ContextVars
-│   │   ├── LoggerMiddleware.py     # Logging de requests/responses
-│   │   └── RequestSizeMiddleware.py# Límite de tamaño de request
-│   ├── models/
-│   │   ├── base.py             # DeclarativeBase + TimestampMixin SQLAlchemy 2.0
-│   │   ├── user.py             # Modelo ORM de ejemplo
-│   │   ├── *_model.py          # Modelos de datos (SQL directo)
-│   │   └── __init__.py         # CRÍTICO: todos los modelos deben importarse aquí
-│   ├── routes/
-│   │   ├── health.py           # GET /health (en app principal)
-│   │   └── v1/
-│   │       ├── __init__.py     # Router v1 que agrupa sub-routers
-│   │       └── test.py         # Endpoints de ejemplo/testing
-│   ├── schemas/                # Schemas Pydantic (opcional)
-│   └── utils/
-│       ├── response.py         # ApiResponse[T], success(), paginated(), empty()
-│       ├── pagination.py       # PaginationParams, PaginationDep
-│       ├── file_upload.py      # save_upload(), save_uploads()
-│       └── dict_utils.py       # Sanitización de dicts (usado por database.py)
-├── alembic/
-│   ├── versions/               # Migraciones generadas
-│   └── env.py                  # Configuración Alembic integrada con el proyecto
-├── docs/                       # Documentación completa
-│   ├── features/               # Por feature: cors, rate-limiting, pagination, etc.
-│   └── development/            # Guías de desarrollo
-├── uploads/                    # Archivos temporales de upload (.gitkeep)
-├── main.py                     # Punto de entrada
-├── pyproject.toml              # Dependencias y configuración
-└── .env.example                # Template de variables de entorno
+routes ──► controllers ──┬──► services (negocio) ──┬──► models ──► core.database ──► MariaDB
+                         │                         └──► services (integración) ──► APIs externas
+                         ├──► services (integración)            (ServiceClient)
+                         └──► models
+schemas ◄── routes, controllers, services          Base: core · utils · exceptions ◄── cualquier capa
 ```
 
-## Componentes Clave
+| Capa | Hace | Prohibido |
+|---|---|---|
+| **routes** | endpoint, schemas, `Depends`, llama **un** método del controller, `success/paginated/empty` | SQL, models, services, httpx, cifrar/hashear, negocio (excepción: `routes/v1/test.py`) |
+| **controllers** | caso de uso: orquesta models y services, 404/409, transacción multi-model. Reciben **schemas** | SQL, httpx, `Request`/`Response`, `ApiResponse`, importar otro controller, transacción abierta durante HTTP |
+| **services** | negocio compartido (≥2 controllers) o transversal (auditoría, notificaciones) · integraciones `XService(ServiceClient)` | `Request`/`Response`/`UploadFile`, importar controllers/routes, SQL (va en models), `httpx.AsyncClient` propio, devolver `httpx.Response` |
+| **models** | SQL / SPs vía `Database` → `dict`/`list`/`int`/`None` | importar services/controllers/schemas, `AppHttpException` (lanzar `ValueError`) |
+| **core · utils · exceptions** | infraestructura con estado · helpers sin estado · errores | negocio, importar capas superiores |
 
-### `app/core/environments.py`
+- Crear un **service** solo si: lo usan ≥2 controllers, es una integración externa, o es transversal.
+  Si solo lo usa un controller, va en el controller.
+- Todo se inyecta con `Depends` (`UserControllerDep`, `UserModelDep`, `HttpbinServiceDep`) y se reemplaza
+  en tests con `dependency_overrides`.
+- `tests/test_architecture.py` verifica estas reglas leyendo los imports (AST): falla si una capa importa
+  otra prohibida, si se crea `httpx.AsyncClient(` fuera de `core/http_client.py` o si un model lanza errores HTTP.
+- **Esquema** (`database/`): tablas y stored procedures en SQL plano. No se usa ORM ni Alembic
+  (Alembic es opcional: `uv add alembic` + pasos en `database/README.md`; `alembic.ini` ya está en la raíz).
 
-Central de todas las variables de entorno. Al agregar una nueva variable, siempre agregarla aquí y documentarla en `.env.example`.
+### App raíz y sub-apps versionadas
 
-Variables actuales:
+```
+main.py  create_app()
+  ├── Middlewares raíz: ContextMiddleware → LoggerMiddleware → CORSMiddleware
+  ├── Lifespan: verificación BD / cierre de clientes HTTP (close_all) + dispose del pool
+  ├── Exception handlers (register_exception_handlers)
+  ├── GET /health   liveness (no toca la BD)
+  ├── GET /ready    readiness (SELECT 1, 503 si la BD no responde)
+  └── /api/v1 → create_versioned_app("v1")
+        ├── RequestSizeMiddleware (REQUEST_MAX_SIZE_MB)
+        ├── Exception handlers
+        └── docs propios: /api/v1/docs, /api/v1/redoc
+```
+
+- Lo transversal (request id, logging, CORS, recursos con ciclo de vida) vive en la **raíz**.
+- La sub-app lleva rutas, documentación y límite de body de la versión.
+- El rate limit global por IP lo aplica nginx (`limit_req`); la app solo limita por ruta (`rate_limit()`).
+- Starlette **no ejecuta el lifespan de sub-apps montadas**: todo recurso se inicia en `main.py`.
+- `dependency_overrides` son por app: en tests se aplican sobre `app.state.versioned_apps["v1"]`.
+
+## Estructura
+
+```
+app/
+├── core/
+│   ├── environment.py       # Settings (pydantic-settings): TODAS las variables de entorno → `settings`
+│   ├── database.py           # Engine async, Database (fetch_one/fetch_all/execute/...), errores BD
+│   ├── rate_limit.py         # rate_limit("5/minute") como dependencia (librería limits)
+│   ├── logging_config.py     # configure_logging(): text/json, request_id, filtros uvicorn
+│   ├── context.py            # ContextVars de la request (request id, ip, user_id...)
+│   ├── versioned_app.py      # create_versioned_app()
+│   ├── http_client.py        # ServiceClient: base de integraciones externas (httpx)
+│   ├── encryption.py         # encrypt/decrypt/rotate (MultiFernet, ENCRYPTION_KEYS)
+│   └── encoding.py           # encode_id/decode_id, EncodedId / EncodedIdOut (sqids)
+├── models/                   # *_model.py: SQL directo async
+├── controllers/              # *_controller.py: casos de uso
+├── services/                 # *_service.py: negocio compartido + integraciones externas
+├── schemas/                  # Schemas Pydantic (entrada/salida)
+├── routes/
+│   ├── health.py             # /health, /ready (app raíz)
+│   └── v1/                   # routes.py arma el router; test.py solo fuera de producción
+├── middleware/               # ASGI puros: Context, Logger, RequestSize
+├── exceptions/               # AppHttpException, handlers, serializador único de errores
+└── utils/                    # response, pagination, file_upload, passwords, dict_utils,
+                              # http, validation_messages (mensajes de validación en español)
+database/                     # Esquema en SQL plano: init/NNN_*.sql (en orden), procedures/
+tests/                        # pytest contra MariaDB real
+main.py                       # create_app() + lifespan
+```
+
+## Configuración (`app/core/environment.py`)
 
 ```python
-# App
-APP_ENV        # development | production
-APP_NAME       # Nombre de la aplicación
-SECRET_KEY     # Clave secreta
-DOCS_ENABLED   # True/False — habilitar /docs y /redoc
+from app.core.environment import settings
 
-# Logger
-LOGGER_LEVEL                        # DEBUG|INFO|WARNING|ERROR|CRITICAL
-LOGGER_MIDDLEWARE_ENABLED           # True/False
-LOGGER_MIDDLEWARE_SHOW_HEADERS      # True/False
-LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS # True/False
-LOGGER_MIDDLEWARE_SHOW_BODY         # True/False
-LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS  # True = path real, False = template
-LOGGER_EXCEPTIONS_ENABLED          # True/False
-LOGGER_MIDDLEWARE_ERRORS_ONLY      # True/False — True suprime logs normales; errores (4xx/5xx) siempre registran REQUEST+ERROR+RESPONSE
-
-# Database
-DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_PORT
-
-# CORS
-CORS_ORIGINS   # Orígenes separados por coma. "*" para todos
-
-# Rate Limiting
-RATE_LIMIT_DEFAULT        # "100/minute", "10/second", "1000/hour"
-RATE_LIMIT_REDIS_ENABLED  # True/False — False = memoria del proceso, True = Redis
-RATE_LIMIT_REDIS_URL      # URI de Redis (solo si RATE_LIMIT_REDIS_ENABLED=True)
-
-# Pagination
-PAGINATION_MAX_SIZE  # Default 50, hard cap en código: 200
-
-# Request Size
-REQUEST_MAX_SIZE_MB  # Default 10
+settings.DB_HOST                      # MAYÚSCULA = variable de entorno (mismo nombre que en .env)
+settings.DB_PASS.get_secret_value()   # secretos (SecretStr): SECRET_KEY, DB_PASS, ENCRYPTION_KEYS, DOCS_PASSWORD...
+settings.is_production                # minúscula = valor derivado (property)
 ```
 
-### `app/core/versioned_app.py` — Factory de Sub-Apps
+- Una sola forma de acceso: el singleton `settings` del módulo (no hay `get_settings()` ni `SettingsDep`).
+  `create_app()`, `create_versioned_app()` y `build_v1_router()` no reciben `settings`: lo importan.
+- Campos en MAYÚSCULA idénticos a la variable de entorno. Derivados en minúscula (properties, siempre
+  calculados): `is_production`, `is_development`, `is_deployed`, `docs_enabled`, `cors_allow_credentials`,
+  `request_max_bytes`, `startup_warnings`.
+- Leer `settings.X` **dentro de la función**, no copiarlo a constantes de módulo (los tests no podrían
+  cambiarlo). Excepción: valores que forman parte del esquema OpenAPI, marcados `# leído al importar`
+  (`PAGINATION_MAX_SIZE` en `app/utils/pagination.py`, `RATE_LIMIT_LOGIN` en `app/routes/v1/test.py`).
+- `APP_ENV` es obligatorio (`development | test | staging | production`).
+- Variable vacía en el `.env` (`DOCS_ENABLED=`) = usar el default (`env_ignore_empty=True`).
+- Configuración inválida → la app no arranca: `RuntimeError` que lista las variables con error **por nombre**,
+  en español, sin mostrar nunca los valores (`hide_input_in_errors=True`).
+- En producción falla al arrancar con: `SECRET_KEY` < 32 caracteres, `DB_PASS` débil, `CORS_ORIGINS=*`,
+  `ENCODING_ALPHABET` por defecto, o secretos repetidos (`SECRET_KEY`/`DB_PASS`/`ENCRYPTION_KEYS`).
+  En staging y producción (`is_deployed`) también sin `ENCRYPTION_KEYS` o con `DOCS_PASSWORD` débil si los
+  docs están protegidos. `ENCRYPTION_KEYS` inválida falla en cualquier entorno. Docs deshabilitados por
+  defecto en producción.
+- **Un secreto por propósito**: `SECRET_KEY` (auth del proyecto), `ENCRYPTION_KEYS` (cifrado), `ENCODING_ALPHABET`
+  (IDs públicos), `DB_PASS`. Nunca derivar uno de otro ni reutilizar `SECRET_KEY` para cifrar.
+- Integraciones externas: solo credenciales al env, con prefijo por servicio (`<NAME>_TOKEN`, `SecretStr`).
+  La URL base va fija en el service; `<NAME>_BASE_URL` solo si cambia entre entornos (sandbox/producción).
+- `SECRET_KEY` queda reservado para la auth del proyecto (el template aún no lo usa), pero se valida en producción.
+- `ENV_FILE` elige el archivo `.env` a leer (vacío = ninguno; los tests lo dejan vacío para que el `.env`
+  del desarrollador no les afecte). `extra="ignore"`: el `.env` también trae variables de infraestructura
+  (`INFRA_ONLY_VARS` = `WORKERS`, `ENV_FILE`). `startup_warnings` (se loguea al arrancar)
+  avisa además de claves desconocidas en el `.env` (typos como `DB_PASWORD`).
+- `.env.example`: sin comentar = **revisar en cada proyecto/entorno** (cambian entre dev/staging/prod o deben coincidir con nginx/BD/workers); comentadas = **opcionales** con default seguro (`# VAR=default`).
+
+**Agregar una variable** (2 pasos; `tests/test_environment.py` falla si falta uno):
+
+1. Campo en `Settings`, en su sección, con tipo y default seguro (sin default = obligatoria).
+2. La misma variable en `.env.example`, en la misma sección, con un comentario de una línea.
+
+`tests/test_environment.py` verifica que `Settings` y `.env.example` estén sincronizados, que `.env.example`
+cargue tal cual, que los secretos no se filtren (repr, dump, errores) y, por AST, que todo `settings.X` usado
+exista y que el código de la app nunca asigne `settings`.
+
+En tests:
 
 ```python
-def create_versioned_app(
-    version: str,
-    excluded_request_size_paths: list[str] | None = None
-) -> FastAPI:
+monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", False)   # se revierte solo
+Settings(_env_file=None, APP_ENV="production", ...)          # tests de validación (tests/test_settings.py)
 ```
 
-Configura automáticamente en orden de ejecución:
-1. `RequestSizeMiddleware` — rechaza requests grandes
-2. `CORSMiddleware` — CORS con `CORS_ORIGINS`
-3. `ContextMiddleware` — Request ID + ContextVars
-4. `LoggerMiddleware` — logging (si `LOGGER_MIDDLEWARE_ENABLED`)
-5. `SlowAPIMiddleware` — rate limiting
+Nunca `cache_clear()` ni reasignar el módulo o el singleton.
 
-También registra los 4 handlers de excepciones: `AppHttpException`, `RequestValidationError`, `RateLimitExceeded`, `Exception`.
+## Base de datos (`app/core/database.py`)
 
-### `app/core/limiter.py`
-
-Singleton `Limiter` de SlowAPI compartido entre todas las versiones. Importar directamente para usar `@limiter.limit()`.
-
-### `app/utils/response.py`
-
-Estandariza todas las respuestas exitosas con `ApiResponse[T]`.
+API única de acceso a datos (SQL directo, async):
 
 ```python
-from app.utils.response import ApiResponse, success, paginated, empty
+from app.core.database import Database, DatabaseDep
 
-# Respuesta con datos
-return success(data=obj)
-return success(data=obj, message="Creado exitosamente")
+row   = await db.fetch_one("SELECT ... WHERE id = :id", {"id": 1})   # dict | None
+rows  = await db.fetch_all("SELECT ...", {...})                      # list[dict]
+total = await db.fetch_value("SELECT COUNT(*) FROM posts")           # escalar
+res   = await db.execute("INSERT ...", {...})                        # ExecResult(rowcount, lastrowid)
+sets  = await db.call_procedure("sp_name", [arg1, arg2])             # list[list[dict]]
 
-# Lista paginada
-return paginated(items, total=total, pagination=pagination)
-
-# Sin datos (DELETE, acciones void)
-return empty("Eliminado exitosamente")
-return empty()
+async with db.transaction() as tx:                                   # varias sentencias atómicas
+    await db.execute("UPDATE ...", {...}, conn=tx)
+    await db.execute("INSERT ...", {...}, conn=tx)
 ```
 
-Los campos `None` se excluyen automáticamente del JSON (via `@model_serializer`). No usar `response_model_exclude_none=True` en cada endpoint.
+Reglas (derivadas de incidentes reales en omnicanal-api):
 
-### `app/utils/pagination.py`
+1. Un engine/pool por worker, creado en el primer uso y cerrado en el lifespan (`dispose_engine`).
+   Nunca crear engines por request ni por instancia.
+2. Cada helper es una unidad de trabajo corta: toma una conexión, ejecuta, materializa a dict y la
+   devuelve al pool. Lecturas sin commit; escrituras con commit automático.
+3. No mantener una conexión/transacción abierta mientras se espera I/O externa (HTTP, colas).
+4. No usar `asyncio.gather` sobre la misma `tx`. Consultas independientes sin `conn=` sí pueden ir en paralelo.
+5. Stored procedures: `call_procedure` drena todos los result sets y cierra el cursor siempre.
+   Si falla, el contexto del error solo lleva `{"count": N}` de los parámetros (nunca sus valores).
+   Ejemplo: `database/procedures/sp_user_stats.sql` (`DELIMITER`, 2 result sets, `SIGNAL`).
+6. Pool: `DB_POOL_TIMEOUT=3` (fallar rápido con 503), `DB_POOL_RECYCLE=180` (< `wait_timeout`),
+   `pre_ping`. Dimensionar: `WORKERS × (DB_POOL_SIZE + DB_MAX_OVERFLOW) × réplicas < max_connections`.
+7. `DB_STATEMENT_TIMEOUT` corta consultas largas en el servidor (MariaDB `max_statement_time`, no aplica en SP).
 
-```python
-from app.utils.pagination import PaginationDep
+Errores de BD traducidos automáticamente a `AppHttpException`:
 
-@router.get("/", response_model=ApiResponse[list[ItemOut]])
-async def list_items(pagination: PaginationDep):
-    items = model.find_all(limit=pagination.size, offset=pagination.offset)
-    total = model.count()
-    return paginated(items, total=total, pagination=pagination)
+| Situación | Status | code / reason |
+|---|---|---|
+| Pool agotado | 503 + Retry-After | `db_unavailable` / `pool_exhausted` |
+| Conexión perdida | 503 + Retry-After | `db_unavailable` / `connection_lost` |
+| Statement timeout | 504 | `db_timeout` / `statement_timeout` |
+| `SIGNAL SQLSTATE '45000'` en SP | 409 (mensaje del SP) | `business_rule` |
+| Clave duplicada | 409 | `conflict` / `duplicate` |
+| FK / integridad | 409 | `conflict` / `integrity` |
+| Otro | 500 | `db_error` |
+
+Los mensajes de `SIGNAL` llegan al cliente: escribirlos aptos para usuario final.
+
+## Crear una feature (receta completa)
+
+### 1. Tabla (`database/init/00N_posts.sql`)
+
+Script nuevo con el siguiente número libre. Nunca modificar un script ya aplicado en otro entorno.
+
+```sql
+CREATE TABLE IF NOT EXISTS posts (
+    id         INT          NOT NULL AUTO_INCREMENT,
+    title      VARCHAR(200) NOT NULL,
+    content    TEXT         NULL,
+    created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
-`PaginationDep = Annotated[PaginationParams, Depends(PaginationParams)]`. Query params: `?page=1&size=20`.
+Aplicarlo con el gestor de BD, el cliente `mariadb` o por el DBA:
 
-### `app/utils/file_upload.py`
-
-```python
-from app.utils.file_upload import save_upload, save_uploads
-
-file_info = await save_upload(
-    file,
-    allowed_types=["image/jpeg", "image/png"],
-    max_size_mb=2,
-)
-file_path = Path(file_info["path"])
-try:
-    content = file_path.read_bytes()
-    # procesar...
-finally:
-    file_path.unlink(missing_ok=True)  # SIEMPRE eliminar el temporal
-```
-
-`uploads/` contiene archivos temporales. Deben eliminarse después de procesar.
-
-### `app/exceptions/`
-
-**`AppHttpException`** — Excepción personalizada que captura automáticamente archivo/función/línea:
-
-```python
-from app.exceptions import AppHttpException
-
-raise AppHttpException(
-    message="Usuario no encontrado",
-    status_code=404,
-    context={"user_id": user_id}  # solo visible en development
-)
-```
-
-**Handlers registrados automáticamente** por `create_versioned_app()`:
-- `app_exception_handler` — para `AppHttpException`
-- `validation_exception_handler` — para `RequestValidationError` (errores Pydantic)
-- `rate_limit_handler` — para `RateLimitExceeded` (SlowAPI 429)
-- `generic_exception_handler` — para cualquier `Exception` no controlada
-
-### `app/core/context.py`
-
-ContextVars disponibles en cualquier parte del código durante el ciclo de vida de la request:
-
-```python
-from app.core.context import (
-    current_http_identifier,  # str — Request ID (16 hex chars)
-    current_request_ip,       # str — IP del cliente
-    current_request_method,   # str — GET, POST, etc.
-    current_request_route,    # str — /users/{user_id}
-    current_user_id,          # str | None — para establecer desde auth middleware
-)
-```
-
-## Flujo de Trabajo: Crear Nueva Feature
-
-### 1. Modelo ORM (si necesita tabla nueva)
-
-```python
-# app/models/post.py
-from app.models.base import Base, TimestampMixin
-from sqlalchemy.orm import Mapped, mapped_column
-
-class Post(Base, TimestampMixin):
-    __tablename__ = "posts"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    title: Mapped[str] = mapped_column()
-    content: Mapped[str | None] = mapped_column(default=None)
-```
-
-Importar en `app/models/__init__.py`:
-```python
-from app.models.post import Post
-__all__ = [..., "Post"]
-```
-
-Generar y aplicar migración:
 ```bash
-uv run alembic revision --autogenerate -m "add posts table"
-uv run alembic upgrade head
+mariadb -h <host> -u <user> -p <db> < database/init/00N_posts.sql
 ```
 
-### 2. Modelo de Datos (SQL directo)
+Los tests borran todas las tablas y aplican `database/init/*.sql` + `database/procedures/*.sql` solos
+(fixture `database_schema`, `sql_statements()` entiende `DELIMITER`). Stored procedures en
+`database/procedures/`. Con docker-compose la BD arranca vacía: cada desarrollador aplica `database/init/*.sql`
+y `database/procedures/*.sql` con su gestor de BD o el cliente `mariadb` (con `DB_USER`/`DB_PASS`);
+ver `database/README.md`.
+
+### 2. Model (`app/models/post_model.py`)
 
 ```python
-# app/models/post_model.py
-from app.core.database import Database
-from app.core.environments import DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_PORT
+from typing import Annotated, Any
+from fastapi import Depends
+from app.core.database import Database, DatabaseDep
+
+_UPDATABLE = frozenset({"title", "content"})   # whitelist si se arman columnas dinámicas
 
 class PostModel:
-    def __init__(self):
-        self.db = Database(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
+    def __init__(self, db: Database):
+        self.db = db
 
-    def find_by_id(self, post_id: int):
-        return self.db.execute_query(
-            "SELECT * FROM posts WHERE id = :id",
-            {"id": post_id},
-            fetchone=True
-        )
+    async def find_by_id(self, post_id: int) -> dict | None:
+        return await self.db.fetch_one("SELECT * FROM posts WHERE id = :id", {"id": post_id})
 
-    def find_all(self, limit: int, offset: int) -> list:
-        return self.db.execute_query(
-            "SELECT * FROM posts LIMIT :limit OFFSET :offset",
+    async def find_all(self, *, limit: int, offset: int) -> list[dict]:
+        return await self.db.fetch_all(
+            "SELECT * FROM posts ORDER BY id DESC LIMIT :limit OFFSET :offset",
             {"limit": limit, "offset": offset},
-            fetchone=False
         )
 
-    def count(self) -> int:
-        result = self.db.execute_query(
-            "SELECT COUNT(*) as total FROM posts",
-            fetchone=True
-        )
-        return result["total"]
+    async def count(self) -> int:
+        return int(await self.db.fetch_value("SELECT COUNT(*) FROM posts") or 0)
 
-    def create(self, data: dict):
-        return self.db.execute_query(
-            "INSERT INTO posts (title, content) VALUES (:title, :content)",
-            data
+    async def create(self, data: dict[str, Any]) -> int:
+        result = await self.db.execute(
+            "INSERT INTO posts (title, content) VALUES (:title, :content)", data
         )
+        return int(result.lastrowid or 0)
+
+def get_post_model(db: DatabaseDep) -> PostModel:
+    return PostModel(db)
+
+PostModelDep = Annotated[PostModel, Depends(get_post_model)]
 ```
 
-### 3. Controlador
+### 3. Controller (`app/controllers/post_controller.py`)
+
+Recibe los **schemas** de la route (no dicts armados por ella) y decide cómo persistirlos.
 
 ```python
-# app/controllers/post_controller.py
-from app.models.post_model import PostModel
-from app.exceptions import AppHttpException
-
 class PostController:
-    def __init__(self):
-        self.post_model = PostModel()
+    def __init__(self, posts: PostModel):
+        self.posts = posts
 
-    def get_post(self, post_id: int):
-        post = self.post_model.find_by_id(post_id)
+    async def get_post(self, post_id: int) -> dict:
+        post = await self.posts.find_by_id(post_id)
         if not post:
-            raise AppHttpException("Post no encontrado", 404, {"post_id": post_id})
+            raise AppHttpException("Post no encontrado", 404, {"post_id": post_id}, code="post_not_found")
         return post
+
+    async def list_posts(self, pagination: PaginationParams) -> tuple[list[dict], int]:
+        items = await self.posts.find_all(limit=pagination.size, offset=pagination.offset)
+        return items, await self.posts.count()
+
+    async def create_post(self, payload: PostCreate) -> dict:
+        post_id = await self.posts.create(payload.model_dump())
+        return await self.get_post(post_id)
+
+def get_post_controller(posts: PostModelDep) -> PostController:
+    return PostController(posts)
+
+PostControllerDep = Annotated[PostController, Depends(get_post_controller)]
 ```
 
-### 4. Schema Pydantic (opcional pero recomendado)
+No hacer "SELECT para ver si existe" antes de un INSERT: tiene carrera. El índice UNIQUE decide y
+la capa de datos lanza 409 (`reason == "duplicate"`); el controller puede re-mapear el mensaje.
+
+### 4. Schemas (`app/schemas/post.py`)
 
 ```python
-# app/schemas/post.py
-from pydantic import BaseModel, Field
-
 class PostCreate(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=200)
     content: str | None = None
 
 class PostOut(BaseModel):
-    id: int
+    id: EncodedIdOut          # el int de la BD sale como string público ("Xk3pQ9aL")
     title: str
     content: str | None
-    created_at: str
-
-    model_config = {"from_attributes": True}
+    created_at: datetime
 ```
 
-### 5. Routes
+### 5. Routes (`app/routes/v1/posts.py`) y registro en `app/routes/v1/routes.py`
 
 ```python
-# app/routes/v1/posts.py
-from fastapi import APIRouter
-from app.controllers.post_controller import PostController
-from app.schemas.post import PostCreate, PostOut
-from app.utils.response import ApiResponse, success, paginated, empty
-from app.utils.pagination import PaginationDep
-
 router = APIRouter(prefix="/posts", tags=["Posts"])
 
-@router.get("/", response_model=ApiResponse[list[PostOut]])
-async def list_posts(pagination: PaginationDep):
-    controller = PostController()
-    posts = controller.post_model.find_all(pagination.size, pagination.offset)
-    total = controller.post_model.count()
-    return paginated(posts, total=total, pagination=pagination)
+@router.get("", response_model=ApiResponse[list[PostOut]])
+async def list_posts(posts: PostControllerDep, pagination: PaginationDep):
+    items, total = await posts.list_posts(pagination)
+    return paginated(items, total=total, pagination=pagination)
 
 @router.get("/{post_id}", response_model=ApiResponse[PostOut])
-async def get_post(post_id: int):
-    return success(data=PostController().get_post(post_id))
+async def get_post(post_id: EncodedId, posts: PostControllerDep):   # llega como int; inválido → 404
+    return success(data=await posts.get_post(post_id))
 
-@router.post("/", response_model=ApiResponse[PostOut], status_code=201)
-async def create_post(post: PostCreate):
-    created = PostController().create_post(post.model_dump())
-    return success(data=created, message="Post creado exitosamente")
-
-@router.delete("/{post_id}", response_model=ApiResponse[None])
-async def delete_post(post_id: int):
-    PostController().delete_post(post_id)
-    return empty("Post eliminado exitosamente")
+@router.post("", response_model=ApiResponse[PostOut], status_code=status.HTTP_201_CREATED)
+async def create_post(payload: PostCreate, posts: PostControllerDep):
+    return success(data=await posts.create_post(payload), message="Post creado")
 ```
-
-### 6. Registrar en Router v1
 
 ```python
-# app/routes/v1/__init__.py
-from fastapi import APIRouter
-from app.routes.v1.posts import router as posts_router
-
-router = APIRouter()
-router.include_router(posts_router)
+# app/routes/v1/routes.py → build_v1_router()
+router.include_router(posts.router)
 ```
 
-## Patrones y Convenciones
-
-### Formato de Respuestas
-
-**SIEMPRE** usar `ApiResponse[T]` como `response_model` y los helpers `success()`, `paginated()`, `empty()`.
+### 6. Test (`tests/test_posts_api.py`)
 
 ```python
-# ✅ Correcto
-@router.get("/{id}", response_model=ApiResponse[UserOut])
-async def get_user(id: int):
-    return success(data=controller.get_user(id))
+pytestmark = pytest.mark.db
 
-# ❌ Incorrecto — rompe el formato estándar
-@router.get("/{id}")
-async def get_user(id: int):
-    return {"id": 1, "name": "John"}
+async def test_get_post_404(client: httpx2.AsyncClient) -> None:
+    resp = await client.get(f"/api/v1/posts/{encode_id(999999)}")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "post_not_found"
 ```
 
-### Errores
+Ejemplo completo de referencia: `users` (`app/models/user_model.py`, `app/controllers/user_controller.py`,
+`app/routes/v1/users.py`, `tests/test_users_api.py`).
 
-**SIEMPRE** usar `AppHttpException` en vez de `HTTPException`:
+## Integraciones externas (`app/services/` + `ServiceClient`)
+
+Cada API externa = un service. Ejemplo de referencia: `app/services/httpbin_service.py` (borrar al iniciar).
 
 ```python
-# ✅ Correcto
-raise AppHttpException("Usuario no encontrado", 404, {"user_id": user_id})
+# 1. app/core/environment.py + .env.example: PAYMENTS_TOKEN (SecretStr)
+# 2. app/services/payments_service.py
+class PaymentsService(ServiceClient):
+    name = "payments"          # aparece en logs y en los mensajes de error
+    base_url = "https://api.payments.example/v1"   # fija; property con settings solo si cambia por entorno
+    timeout = 15               # opcional (default HTTP_CLIENT_TIMEOUT)
 
-# ❌ Incorrecto
-from fastapi import HTTPException
-raise HTTPException(status_code=404, detail="Not found")
+    def headers(self) -> dict[str, str]:       # por request: un token rotado aplica sin reiniciar
+        return {"Authorization": f"Bearer {settings.PAYMENTS_TOKEN.get_secret_value()}"}
+
+    async def get_order(self, order_id: str) -> dict:          # métodos de negocio, nunca httpx.Response
+        return await self.get_json(f"/orders/{order_id}")
+
+    async def find_order(self, order_id: str) -> dict | None:  # 404 esperado → None
+        response = await self.request("GET", f"/orders/{order_id}", allow={404})
+        return None if response.status_code == 404 else response.json()
+
+PaymentsServiceDep = Annotated[PaymentsService, Depends(PaymentsService.instance)]
+
+# 3. El controller lo recibe por constructor (get_x_controller(..., payments: PaymentsServiceDep))
 ```
 
-### Rate Limiting por Ruta
+La base ya resuelve (no reimplementar): pool httpx **por servicio** (perezoso, cerrado en el lifespan con
+`close_all()`), timeouts de conexión/total/pool, sin seguir redirects, `X-Request-ID` propagado, reintentos
+con backoff **solo** en GET/HEAD/OPTIONS/PUT/DELETE (`retry=True` para un POST con idempotency key),
+`Retry-After` ≤ 5s, logs por intento sin query string ni bodies. Errores traducidos:
+
+| Situación | Status | code / reason |
+|---|---|---|
+| Pool del servicio lleno | 503 | `external_service_unavailable` / `pool_exhausted` |
+| No conecta / conexión cortada | 503 | `external_service_unavailable` / `connection_error` |
+| Timeout | 504 | `external_service_timeout` / `timeout` |
+| Proveedor responde 429/503 | 503 (+ su `Retry-After`) | `external_service_unavailable` / `upstream_429` |
+| Proveedor responde 401/403 | 502 (**nunca** se reenvía el 401) | `external_service_error` / `upstream_auth` |
+| Otro 4xx/5xx, redirect, JSON inválido | 502 | `external_service_error` / `upstream_<status>` / `invalid_json` |
+
+**Prohibido**: `httpx.AsyncClient(...)` fuera de `core/http_client.py` (lo verifica `test_architecture.py`),
+`requests`, llamar un servicio externo con una transacción de BD abierta, reenviar al cliente el status o body
+del proveedor, poner tokens en la query string si el proveedor acepta headers.
+
+Tests sin red: `PaymentsService(transport=httpx.MockTransport(handler))` y
+`v1_app.dependency_overrides[PaymentsService.instance] = lambda: fake` (ver `tests/test_http_client.py`).
+
+## Seguridad: cifrado, contraseñas y encoding de IDs
 
 ```python
-from fastapi import Request
-from app.core.limiter import limiter
-
-@router.post("/login")
-@limiter.limit("5/minute")
-async def login(request: Request, credentials: LoginSchema):
-    # request: Request es REQUERIDO para que SlowAPI funcione
-    ...
+from app.core.encryption import encrypt, decrypt, rotate, DecryptionError   # datos sensibles reversibles
+from app.utils.passwords import encrypt_password, verify_password, reveal_password
+from app.core.encoding import EncodedId, EncodedIdOut, encode_id, decode_id
 ```
 
-### Seguridad SQL
+- **Cifrado** (`ENCRYPTION_KEYS`, MultiFernet): la primera llave cifra, todas descifran. Rotar = nueva llave
+  al inicio → `rotate(token)` → quitar la vieja. `DecryptionError` nunca incluye el token. Sin la variable
+  (solo dev/test) se usa una llave temporal y se avisa al arrancar. Datos de omnicanal: agregar
+  `fernet_key_from_secret(<su SECRET_KEY>)` al final de `ENCRYPTION_KEYS` y re-cifrar con `rotate()`.
+- **Contraseñas: cifrado reversible** (decisión del equipo, para auditar). El controller cifra
+  (`encrypt_password`), el login compara con `verify_password(pw, stored_or_None)` (nunca lanza; `None` =
+  usuario inexistente). `reveal_password()` solo para auditoría/soporte: nunca en respuestas ni logs.
+  Riesgo: BD + `ENCRYPTION_KEYS` = todas las contraseñas → la llave vive fuera de la BD y se respalda aparte.
+  Columna `VARCHAR(512)`; `max_length=128` en el schema.
+- **Encoding de IDs** (`app/core/encoding.py`, sqids, `ENCODING_ALPHABET` propio y fijo por proyecto): `EncodedId` en la **entrada**
+  (path/query/body: solo acepta el string; inválido en la URL → 404, en el body → 422) y `EncodedIdOut` en
+  la **salida** (el int del model se serializa como string). Es ofuscación, no autorización: validar acceso igual.
+
+Detalle: `docs/features/services.md` y `docs/features/security.md`.
+
+## Respuestas (`app/utils/response.py`)
+
+**Siempre** `response_model=ApiResponse[T]` y los helpers:
 
 ```python
-# ✅ SIEMPRE usar parámetros
-db.execute_query("SELECT * FROM users WHERE id = :id", {"id": user_id})
-
-# ❌ NUNCA concatenar strings — SQL injection
-db.execute_query(f"SELECT * FROM users WHERE id = {user_id}")
+return success(data=obj, message="Creado")          # {"data": ..., "message": ...}
+return paginated(items, total=total, pagination=p)  # {"data": [...], "pagination": {...}}
+return empty("Eliminado")                           # {"message": "Eliminado"}
 ```
 
-### Logging con Request ID
+Los campos de primer nivel con `None` se excluyen del JSON (`Field(exclude_if=...)`); los `None` dentro de
+`data` se conservan. El esquema OpenAPI mantiene `data`/`message`/`pagination` tipados.
+
+Estilo FastAPI moderno: `Annotated[...]` para `Query`/`File`/`Depends`, `Field(min_length=...)` sin `...`,
+`status_code=status.HTTP_201_CREATED`.
+
+## Errores (`app/exceptions/`)
+
+**Siempre** `AppHttpException`, nunca `HTTPException`:
 
 ```python
-from app.core.logger import get_logger
-from app.core.context import current_http_identifier
-
-logger = get_logger(__name__)
-
-def some_function():
-    request_id = current_http_identifier.get()
-    logger.info(f"{request_id} | Operación completada")
+raise AppHttpException("Usuario no encontrado", 404, {"user_id": user_id}, code="user_not_found")
+raise AppHttpException("Demasiados intentos", 429, headers={"Retry-After": "60"}, code="rate_limited")
 ```
 
-### File Upload
+Formato único de error (handlers y middlewares usan `app/exceptions/responses.py`):
+
+```json
+{"detail": {
+  "msg": "texto para el usuario",
+  "type": "NotFound",
+  "code": "user_not_found",
+  "reason": "opcional",
+  "errors": [{"field": "email", "message": "es obligatorio", "type": "missing"}],
+  "request_id": "a1b2c3d4e5f60708",
+  "context": {"...": "solo development"},
+  "loc": {"file": "...", "function": "...", "line": 10, "code": "... (solo 500 no controlado, development)"}
+}}
+```
+
+- `message`: seguro para el usuario. Nunca `str(e)` ahí; los detalles van a `context`.
+- `context`: solo en development. `loc` (archivo/función/línea, del traceback): solo en los 500 no
+  controlados y solo en development; los 4xx llevan solo `context`.
+- `code` / `reason`: estables, snake_case, para que el frontend decida.
+- 422 de validación: mensajes en español, sin el valor enviado (`input`).
+- 5xx y excepciones no controladas: se loguean siempre, una sola vez, con el frame del proyecto.
+- Middlewares: nunca envolver `await self.app(...)` en `except Exception`; responder con `error_response()`.
+
+## Rate limiting (`app/core/rate_limit.py`)
 
 ```python
-from fastapi import UploadFile, File
-from pathlib import Path
-from app.utils.file_upload import save_upload
+from app.core.rate_limit import rate_limit
 
-@router.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    file_info = await save_upload(
-        file,
-        allowed_types=["image/jpeg", "image/png"],
-        max_size_mb=2,
-    )
-    file_path = Path(file_info["path"])
-    try:
-        content = file_path.read_bytes()
-        # procesar...
-        return success(data={"processed": True})
-    finally:
-        file_path.unlink(missing_ok=True)  # siempre eliminar
+@router.post("/login", dependencies=[rate_limit("5/minute")])
+async def login(...): ...
 ```
 
-## Nombres de Archivos y Clases
+- Límite por ruta (login, registro, endpoints costosos). El global por IP es `limit_req` de nginx.
+- Clave: IP del cliente (`request.client.host`). Requiere uvicorn con `--forwarded-allow-ips` = IP del proxy.
+- En memoria cada worker cuenta por separado: con varios workers usar `RATE_LIMIT_REDIS_ENABLED=True`
+  (`uv sync --extra redis`, cliente redis-py) y/o `limit_req` de nginx (ya configurado).
+- Fail-open: si el storage falla o está mal configurado, la request pasa y se loguea un warning.
+- FastAPI resuelve las dependencias **después** de leer el body: el límite de la app no evita recibir
+  bodies grandes. El freno duro es `limit_req` de nginx (+ `RequestSizeMiddleware`).
 
-- **Modelos ORM**: `app/models/post.py` → clase `Post`
-- **Modelos SQL**: `app/models/post_model.py` → clase `PostModel`
-- **Controladores**: `app/controllers/post_controller.py` → clase `PostController`
-- **Routes**: `app/routes/v1/posts.py` → variable `router`
-- **Schemas**: `app/schemas/post.py` → clases `PostCreate`, `PostOut`
-- **Clases**: `PascalCase`
-- **Funciones/variables**: `snake_case`
+## Logging
 
-## Tecnologías Clave
+```python
+import logging
+logger = logging.getLogger(__name__)
+logger.info("Operación completada")   # el request_id se agrega automáticamente
+```
 
-- **FastAPI** con sub-app mounting para API versioning
-- **SQLAlchemy 2.0** — ORM con sintaxis `Mapped[]`, `mapped_column()`
-- **Alembic** — migraciones automáticas
-- **SlowAPI** — rate limiting por IP
-- **Pydantic v2** — validación y serialización
-- **uv** — gestor de paquetes ultrarrápido
-- **Ruff** — linter y formateador
-- **Python 3.13+**
+- `LOG_FORMAT=json` para agregadores. Una línea de access log por request (nivel según status).
+- **Nunca se loguea el body** de las requests. Headers sensibles (lista fija + `is_sensitive_key`) y query
+  params sensibles se enmascaran.
+- El logger raíz usa el mismo handler a nivel WARNING (librerías con el mismo formato/JSON).
 
-## Comandos Útiles
+## Otros utilitarios
+
+- **Paginación**: `PaginationDep` → `?page=1&size=20` (`pagination.size`, `pagination.offset`; `page` ≤ 1 000 000).
+- **Uploads**: `await save_upload(file, allowed_types=[...], max_size_mb=2)` guarda por bloques;
+  procesar y **siempre** `await anyio.Path(info["path"]).unlink(missing_ok=True)` en `finally`.
+- **Límite de body**: `REQUEST_MAX_SIZE_MB` para toda la versión (igual a `client_max_body_size` de nginx;
+  sin overrides por ruta). Para archivos más grandes, subir ambos.
+- **ContextVars** (auditoría: quién/desde dónde/qué ruta): `from app.core.context import current_http_identifier,
+  current_request_ip, current_user_id` (la capa de auth del proyecto debe hacer `current_user_id.set(...)`).
+
+## Seguridad SQL
+
+```python
+# ✅ Siempre parámetros
+await db.fetch_one("SELECT * FROM users WHERE id = :id", {"id": user_id})
+
+# ❌ Nunca interpolar valores (SQL injection)
+await db.fetch_one(f"SELECT * FROM users WHERE id = {user_id}")
+```
+
+Si hay que interpolar nombres de columna (UPDATE dinámico, ORDER BY), validarlos contra una whitelist
+(ver `UserModel.update`).
+
+## Tests
 
 ```bash
-# Desarrollo
-uv run uvicorn main:app --reload
-uv run uvicorn main:app --reload --host 0.0.0.0 --port 8080
+docker compose -f docker-compose.test.yml up -d --wait   # MariaDB en RAM, puerto 3307
+uv run pytest                                            # los tests @db se saltan si no hay BD
+uv run ruff check . && uv run ruff format --check .
+```
 
-# Migraciones
-uv run alembic revision --autogenerate -m "descripción"
-uv run alembic upgrade head
-uv run alembic downgrade -1
-uv run alembic current
-uv run alembic history
+- Fixtures en `tests/conftest.py`: `client` (httpx2 + lifespan), `db`, `v1_app`, `clean_users`.
+- Tests con BD: `pytestmark = pytest.mark.db`. Se prueba contra MariaDB real, no SQLite.
+- Override de dependencias: `v1_app.dependency_overrides[get_user_controller] = Fake`.
+- `ENV_FILE=""` en tests: el `.env` local no se lee.
+- `filterwarnings`: `DeprecationWarning`, `FastAPIDeprecationWarning`, `StarletteDeprecationWarning` y
+  `UvicornDeprecationWarning` (y `RuntimeWarning`) son errores.
 
-# Dependencias
-uv add <paquete>
-uv remove <paquete>
-uv sync
+## Nombres
+
+- Tablas: `database/init/00N_posts.sql` → tabla `posts`
+- Models SQL: `app/models/post_model.py` → `PostModel`, `PostModelDep`
+- Controllers: `app/controllers/post_controller.py` → `PostController`, `PostControllerDep`
+- Services: `app/services/payments_service.py` → `PaymentsService`, `PaymentsServiceDep`
+- Routes: `app/routes/v1/posts.py` → `router`
+- Schemas: `app/schemas/post.py` → `PostCreate`, `PostUpdate`, `PostOut`
+- Clases `PascalCase`, funciones/variables `snake_case`.
+
+## Stack
+
+FastAPI 0.142 · Starlette 1.7 · SQLAlchemy 2.1 (asyncio) + asyncmy · Pydantic 2.13 + pydantic-settings ·
+limits · httpx · cryptography (Fernet) · sqids · uvicorn 0.54 · pytest-asyncio + httpx2 · Ruff · uv · Python ≥3.13 (3.14 por defecto).
+
+## Comandos
+
+```bash
+cp .env.example .env
+uv sync --all-groups
+uv run fastapi dev                      # desarrollo con reload (reiniciar si cambia .env)
+docker compose up -d --build            # db (vacía: aplicar database/*.sql con el gestor) → api → nginx
+mariadb -h <host> -u <user> -p <db> < database/init/00N_x.sql   # cambio de esquema en BD existente
 ```
 
 ## Documentación
 
-- `docs/` — documentación completa por feature
-- `readme.md` — instalación y uso general
-- FastAPI genera Swagger en `/api/v1/docs` y ReDoc en `/api/v1/redoc`
-- Documentación deshabilitada si `DOCS_ENABLED=False`
-
-## Próximos Pasos Comunes
-
-### Autenticación JWT
-
-```bash
-uv add python-jose[cryptography] passlib[bcrypt]
-```
-
-1. Agregar campos auth al modelo `User`
-2. Crear endpoints `/auth/login`, `/auth/register`
-3. Crear `AuthMiddleware` que lee JWT y llama `current_user_id.set(user_id)`
-4. Registrar middleware en `create_versioned_app()`
-
-### Testing
-
-```bash
-uv add --group dev pytest pytest-asyncio httpx
-```
-
-Crear `tests/conftest.py` con `TestClient` y fixtures.
-
-### Redis para Rate Limiting Multi-Worker
-
-```python
-# app/core/limiter.py
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[RATE_LIMIT_DEFAULT],
-    storage_uri="redis://localhost:6379",
-)
-```
+- `docs/features/`: detalle por feature (database, services, security, exceptions, logging, rate-limiting...).
+- `docs/development/best-practices.md`, `docs/deployment.md`, `docs/docker-deployment.md`.
+- Swagger en `/api/v1/docs`, ReDoc en `/api/v1/redoc` (deshabilitados por defecto en producción).
 
 ---
 
-**Nota para Agentes**: Mantén consistencia con la arquitectura existente. Todo endpoint debe usar `ApiResponse[T]`. Todo error controlado debe usar `AppHttpException`. Consulta `docs/` para detalles de cada feature.
+**Nota para agentes**: mantener la consistencia. Todo endpoint usa `ApiResponse[T]`, todo error
+controlado usa `AppHttpException`, todo acceso a datos es `await db.*`, toda API externa es un
+`ServiceClient`, nada bloqueante en `async def`.
+Actualizar la documentación en el mismo cambio que el código.

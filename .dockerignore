@@ -36,4 +36,13 @@ uploads/*
 
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
-Thumbbs.db
+Thumbs.db
+
+# ── Tests y tooling (no van en la imagen) ────────────────────────────────────
+tests/
+.pre-commit-config.yaml
+docker-compose*.yml
+docs/
+database/
+# Alembic es opcional (no instalado). Quitar esta línea si se usan migraciones en el contenedor
+alembic.ini

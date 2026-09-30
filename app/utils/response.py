@@ -1,11 +1,13 @@
 import math
-from typing import Any, Generic, TypeVar
+from typing import Any
 
-from pydantic import BaseModel, model_serializer
+from pydantic import BaseModel, Field
 
 from app.utils.pagination import PaginationParams
 
-T = TypeVar("T")
+
+def _is_none(value: Any) -> bool:
+    return value is None
 
 
 class PaginationMeta(BaseModel):
@@ -17,7 +19,7 @@ class PaginationMeta(BaseModel):
     has_prev: bool
 
 
-class ApiResponse(BaseModel, Generic[T]):
+class ApiResponse[T](BaseModel):
     """
     Envelope estándar para todas las respuestas exitosas de la API.
 
@@ -26,9 +28,10 @@ class ApiResponse(BaseModel, Generic[T]):
         message:    Mensaje para el usuario final. Ausente si no se proporciona.
         pagination: Metadata de paginación. Solo presente en respuestas paginadas.
 
-    Los campos con valor None se excluyen automáticamente del JSON de salida,
-    por lo que 'pagination' nunca aparece en respuestas no paginadas y 'message'
-    solo aparece cuando el developer lo proporciona explícitamente.
+    Los campos de nivel superior con valor None se excluyen del JSON de salida
+    (exclude_if), por lo que 'pagination' nunca aparece en respuestas no paginadas y
+    'message' solo aparece cuando se proporciona. Los None DENTRO de 'data' se conservan.
+    El esquema OpenAPI conserva los tres campos tipados (clientes generados con tipos).
 
     Nota sobre errores:
         Las excepciones (AppHttpException, RequestValidationError, etc.) retornan
@@ -37,33 +40,26 @@ class ApiResponse(BaseModel, Generic[T]):
         conflicto entre ambos formatos. Son capas independientes.
 
     Uso básico:
-        @router.get("/{id}", response_model=ApiResponse[UserOut])
-        async def get_user(id: int) -> ApiResponse[UserOut]:
-            user = controller.get_user(id)
-            return success(data=user)
+        @router.get("/{user_id}", response_model=ApiResponse[UserOut])
+        async def get_user(user_id: int, users: UserControllerDep):
+            return success(data=await users.get_user(user_id))
 
     Uso paginado:
-        @router.get("/", response_model=ApiResponse[list[UserOut]])
-        async def list_users(pagination: PaginationDep) -> ApiResponse[list[UserOut]]:
-            users = model.find_all(limit=pagination.size, offset=pagination.offset)
-            total = model.count()
-            return paginated(users, total=total, pagination=pagination)
+        @router.get("", response_model=ApiResponse[list[UserOut]])
+        async def list_users(pagination: PaginationDep, users: UserControllerDep):
+            items, total = await users.list_users(pagination)
+            return paginated(items, total=total, pagination=pagination)
 
     Uso sin contenido (DELETE, operaciones void):
-        @router.delete("/{id}", response_model=ApiResponse[None])
-        async def delete_user(id: int) -> ApiResponse[None]:
-            controller.delete_user(id)
+        @router.delete("/{user_id}", response_model=ApiResponse[None])
+        async def delete_user(user_id: int, users: UserControllerDep):
+            await users.delete_user(user_id)
             return empty("Usuario eliminado exitosamente")
     """
 
-    data: T | None = None
-    message: str | None = None
-    pagination: PaginationMeta | None = None
-
-    @model_serializer(mode="wrap")
-    def _exclude_none(self, handler) -> dict[str, Any]:
-        """Excluye automáticamente los campos None del JSON de salida."""
-        return {k: v for k, v in handler(self).items() if v is not None}
+    data: T | None = Field(default=None, exclude_if=_is_none)
+    message: str | None = Field(default=None, exclude_if=_is_none)
+    pagination: PaginationMeta | None = Field(default=None, exclude_if=_is_none)
 
 
 # ---------------------------------------------------------------------------
@@ -110,10 +106,9 @@ def paginated(
         from app.utils.response import ApiResponse, paginated
 
         @router.get("/users", response_model=ApiResponse[list[UserOut]])
-        async def list_users(pagination: PaginationDep):
-            users = model.find_all(limit=pagination.size, offset=pagination.offset)
-            total = model.count()
-            return paginated(users, total=total, pagination=pagination)
+        async def list_users(pagination: PaginationDep, users: UserControllerDep):
+            items, total = await users.list_users(pagination)
+            return paginated(items, total=total, pagination=pagination)
 
     Salida:
         {

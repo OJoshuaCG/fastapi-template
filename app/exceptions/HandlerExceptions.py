@@ -1,243 +1,192 @@
-import sys
+"""
+Handlers globales de excepciones.
+
+`register_exception_handlers(app)` se llama en la app raíz y en cada sub-app versionada,
+para que todas las respuestas de error tengan el mismo formato (ver `responses.py`).
+"""
+
+import logging
 import traceback
 from pathlib import Path
 from typing import Any
 
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from slowapi.errors import RateLimitExceeded
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.context import current_http_identifier
-from app.core.environments import APP_ENV, LOGGER_EXCEPTIONS_ENABLED, ROOT_DIR
-from app.core.logger import get_logger
-from app.exceptions import AppHttpException
+from app.core.encoding import ENCODED_ID_ERROR
+from app.core.environment import APP_DIR, ROOT_DIR, settings
+from app.exceptions.AppHttpException import AppHttpException
+from app.exceptions.responses import DEFAULT_MESSAGES, error_response
+from app.utils.dict_utils import sanitize
+from app.utils.http import client_ip, log_level_for_status
+from app.utils.validation_messages import format_validation_errors
 
-if LOGGER_EXCEPTIONS_ENABLED:
-    logger = get_logger(level="WARNING")
+logger = logging.getLogger(__name__)
 
-
-async def app_exception_handler(request: Request, exc: AppHttpException):
-    detail_error = {
-        "msg": exc.message,
-        "type": exc.__class__.__name__,
-    }
-
-    if LOGGER_EXCEPTIONS_ENABLED:
-        logger_warning_exception = [
-            current_http_identifier.get(),
-            f"Exception: {exc.__class__.__name__}",
-            f"Message: {exc.message}",
-            f"Status Code: {exc.status_code}",
-            f"Context: {getattr(exc, 'context', None)}",
-            f"Loc: {exc.loc}",
-        ]
-        logger.warning(" | ".join(logger_warning_exception))
-
-    if APP_ENV == "development":
-        if getattr(exc, "context", None):
-            detail_error["context"] = exc.context
-
-        if getattr(exc, "loc", None):
-            detail_error["loc"] = exc.loc
-
-    return JSONResponse(status_code=exc.status_code, content={"detail": detail_error})
+# Marca en la excepción para no loguear dos veces el mismo 500: la sub-app lo maneja y
+# Starlette lo relanza hacia la app raíz, que vuelve a invocar el handler genérico.
+_LOGGED_MARKER = "_app_unhandled_logged"
 
 
-async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    detail_error = {
-        "msg": f"Demasiadas solicitudes. Límite: {exc.detail}",
-        "type": "RateLimitExceeded",
-    }
-
-    if LOGGER_EXCEPTIONS_ENABLED:
-        logger_params = [
-            str(current_http_identifier.get()),
-            "Exception: RateLimitExceeded",
-            f"Limit: {exc.detail}",
-            f"IP: {request.client.host if request.client else 'unknown'}",
-        ]
-        logger.warning(" | ".join(logger_params))
-
-    return JSONResponse(status_code=429, content={"detail": detail_error})
+def _request_id(request: Request) -> str | None:
+    # request.state sobrevive aunque los contextvars ya se hayan reseteado
+    return getattr(request.state, "request_id", None)
 
 
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    _LOCATION_PREFIXES = {"body", "query", "path", "header"}
-
-    fields_with_errors = []
-    for error in exc.errors():
-        loc = error.get("loc", ())
-        field_parts = [str(p) for p in loc if p not in _LOCATION_PREFIXES]
-        field = ".".join(field_parts) if field_parts else str(loc)
-        fields_with_errors.append({"field": field, "msg": error.get("msg", "")})
-
-    field_names = [f["field"] for f in fields_with_errors]
-    msg = (
-        f"Error de validación en: {', '.join(field_names)}"
-        if field_names
-        else "Error de validación en los datos enviados"
+async def app_exception_handler(request: Request, exc: AppHttpException) -> JSONResponse:
+    if exc.status_code >= 500 or settings.LOGGER_EXCEPTIONS_ENABLED:
+        logger.log(
+            log_level_for_status(exc.status_code),
+            "%s | %s %s | %s %s | code=%s reason=%s | context=%s",
+            client_ip(request.scope),
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.message,
+            exc.code,
+            exc.reason,
+            sanitize(exc.context),
+        )
+    return error_response(
+        exc.status_code,
+        exc.message,
+        headers=dict(exc.headers) if exc.headers else None,
+        code=exc.code,
+        reason=exc.reason,
+        errors=exc.errors,
+        public=exc.public,
+        context=sanitize(exc.context),
+        request_id=_request_id(request),
     )
 
-    detail_error = {"msg": msg, "type": "RequestValidationError"}
 
-    if APP_ENV == "development":
-        detail_error["context"] = fields_with_errors
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    raw_errors = exc.errors()
+    # ID público inválido en la URL (/users/abc): para el cliente el recurso no existe
+    if any(
+        e.get("type") == ENCODED_ID_ERROR and e.get("loc", ("",))[0] == "path" for e in raw_errors
+    ):
+        return error_response(404, request_id=_request_id(request))
 
-    if LOGGER_EXCEPTIONS_ENABLED:
-        logger_params = [
-            str(current_http_identifier.get()),
-            "Exception: RequestValidationError",
-            f"Fields: {', '.join(field_names)}",
-        ]
-        logger.warning(" | ".join(logger_params))
-
-    return JSONResponse(status_code=422, content={"detail": detail_error})
-
-
-async def generic_exception_handler(request: Request, exc: Exception):
-    detail_error = {"msg": "Error interno del servidor", "type": "InternalServerError"}
-
-    trace_info = _get_full_traceback_info(exc, ROOT_DIR)
-
-    if APP_ENV == "development":
-        detail_error["context"] = {
-            "type_error": exc.__class__.__name__,
-            "exception": str(exc),
-        }
-        detail_error["loc"] = trace_info["origin"]
-
-    if LOGGER_EXCEPTIONS_ENABLED:
-        logger_warning_exception_params = [
-            current_http_identifier.get(),
-            f"Exception: {exc.__class__.__name__}",
-            f'Message: UNHANDLED EXC. "{str(exc)}"',
-            f"File: {trace_info['origin']['file']}",
-            f"Function: {trace_info['origin']['function']}",
-            f"Line: {trace_info['origin']['line']}",
-            f'Code: "{trace_info["origin"]["code"]}"',
-        ]
-        logger.error(" | ".join(logger_warning_exception_params))
-
-    return JSONResponse(status_code=500, content={"detail": detail_error})
-
-
-def _get_full_traceback_info(
-    exc: Exception, project_root: Path | None = None
-) -> dict[str, Any]:
-    """
-    Obtiene el traceback completo de la excepción
-    """
-    tb_list = traceback.extract_tb(sys.exc_info()[2])
-
-    # Convertir cada frame del traceback
-    trace_frames = []
-    for frame in tb_list:
-        absolute_path = Path(frame.filename)
-
-        # Calcular ruta relativa
-        if project_root:
-            try:
-                relative_path = absolute_path.relative_to(project_root)
-                file_path = str(relative_path).replace("\\", "/")
-            except ValueError:
-                file_path = absolute_path.name
-        else:
-            file_path = absolute_path.name
-
-        trace_frames.append(
-            {
-                "file": file_path,
-                "function": frame.name,
-                "line": frame.lineno,
-                "code": frame.line,
-            }
-        )
-
-    # El ultimo frame es donde ocurrio el error
-    origin = (
-        trace_frames[-1]
-        if trace_frames
-        else {"file": "unknown", "function": "unknown", "line": 0, "code": None}
-    )
-
-    return {
-        "origin": origin,  # Donde ocurrio el error
-        "full_trace": trace_frames,  # Traceback completo
-    }
-
-
-def _get_full_traceback(exc: Exception, project_root: Path | None = None) -> list[dict]:
-    """Obtiene el traceback completo"""
-    tb_list = traceback.extract_tb(sys.exc_info()[2])
-
-    frames = []
-    for frame in tb_list:
-        absolute_path = Path(frame.filename)
-
-        if project_root:
-            try:
-                relative_path = absolute_path.relative_to(project_root)
-                file_path = str(relative_path).replace("\\", "/")
-            except ValueError:
-                file_path = absolute_path.name
-        else:
-            file_path = absolute_path.name
-
-        frames.append(
-            {
-                "file": file_path,
-                "function": frame.name,
-                "line": frame.lineno,
-                "code": frame.line,
-            }
-        )
-
-    return frames
-
-
-def _get_exception_info(
-    exc: Exception, project_root: Path | None = None, depth: int = 2
-) -> dict[str, Any]:
-    """
-    Obtiene informacion detallada de donde se origino la excepción
-    """
-    # Obtener el traceback
-    tb = sys.exc_info()[2]
-
-    if tb is None:
-        return {"file": "unknown", "function": "unknown", "line": 0, "code": None}
-
-    # Ir al ultimo frame del traceback (donde ocurrio el error)
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-
-    frame = tb.tb_frame
-    absolute_path = Path(frame.f_code.co_filename)
-
-    # Calcular ruta relativa
-    if project_root:
-        try:
-            relative_path = absolute_path.relative_to(project_root)
-            file_path = str(relative_path).replace("\\", "/")
-        except ValueError:
-            parts = absolute_path.parts[-depth:]
-            file_path = "/".join(parts)
+    errors = format_validation_errors(raw_errors)
+    if errors:
+        first = errors[0]
+        msg = f"Error de validación: {first['field']} {first['message']}"
     else:
-        parts = absolute_path.parts[-depth:]
-        file_path = "/".join(parts)
+        msg = DEFAULT_MESSAGES[422]
 
-    # Obtener el codigo que causo el error
+    if settings.LOGGER_EXCEPTIONS_ENABLED:
+        logger.warning(
+            "%s | %s %s | 422 | campos: %s",
+            client_ip(request.scope),
+            request.method,
+            request.url.path,
+            ", ".join(e["field"] for e in errors),
+        )
+    return error_response(
+        422, msg, code="validation_error", errors=errors, request_id=_request_id(request)
+    )
+
+
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """404/405 de rutas, 401 de docs, 413 del límite de body, HTTPException nativo."""
+    detail = exc.detail
+    msg: str | None = None
+    if isinstance(detail, str) and detail and not _is_default_phrase(exc.status_code, detail):
+        msg = detail
+    return error_response(
+        exc.status_code,
+        msg,
+        headers=getattr(exc, "headers", None),
+        request_id=_request_id(request),
+    )
+
+
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Excepciones no controladas: siempre se loguean (una sola vez) con el frame del proyecto."""
+    rid = _request_id(request)
+    origin = _project_frame(exc)
+
+    if not getattr(exc, _LOGGED_MARKER, False):
+        try:
+            setattr(exc, _LOGGED_MARKER, True)
+        except AttributeError:  # excepciones con __slots__
+            pass
+        logger.error(
+            "%s | %s %s | 500 | %s: %s | %s:%s en %s()",
+            client_ip(request.scope),
+            request.method,
+            request.url.path,
+            type(exc).__name__,
+            exc,
+            origin.get("file"),
+            origin.get("line"),
+            origin.get("function"),
+            exc_info=exc,
+        )
+
+    headers = {"X-Request-ID": rid} if rid else None
+    return error_response(
+        500,
+        headers=headers,
+        context={"type_error": type(exc).__name__, "exception": str(exc)},
+        loc=origin,
+        request_id=rid,
+    )
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    app.add_exception_handler(AppHttpException, app_exception_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(Exception, generic_exception_handler)
+
+
+# ---------------------------------------------------------------------------
+
+
+# Textos en inglés que emiten FastAPI/Starlette: se reemplazan por el mensaje en español
+_FRAMEWORK_DETAILS = {
+    "Not authenticated",
+    "Content Too Large",
+    "Invalid authentication credentials",
+}
+
+
+def _is_default_phrase(status_code: int, detail: str) -> bool:
+    from http import HTTPStatus
+
+    if detail in _FRAMEWORK_DETAILS:
+        return True
     try:
-        import linecache
+        return detail == HTTPStatus(status_code).phrase
+    except ValueError:
+        return False
 
-        code_line = linecache.getline(str(absolute_path), frame.f_lineno).strip()
-    except Exception:
-        code_line = None
 
-    return {
-        "file": file_path,
-        "function": frame.f_code.co_name,
-        "line": frame.f_lineno,
-        "code": code_line,
-    }
+def _is_project_file(filename: str) -> bool:
+    """Frame dentro de app/ (por segmento de ruta, no por substring de la ruta)."""
+    try:
+        Path(filename).resolve().relative_to(APP_DIR)
+    except ValueError:
+        return False
+    return True
+
+
+def _project_frame(exc: BaseException) -> dict[str, Any]:
+    """Último frame del traceback que pertenece al proyecto (no a librerías)."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    chosen = next((f for f in reversed(frames) if _is_project_file(f.filename)), None)
+    if chosen is None and frames:
+        chosen = frames[-1]
+    if chosen is None:
+        return {"file": "unknown", "function": "unknown", "line": 0, "code": None}
+    try:
+        file = Path(chosen.filename).resolve().relative_to(ROOT_DIR).as_posix()
+    except ValueError:
+        file = Path(chosen.filename).name
+    return {"file": file, "function": chosen.name, "line": chosen.lineno, "code": chosen.line}

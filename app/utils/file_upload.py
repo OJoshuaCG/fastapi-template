@@ -1,15 +1,44 @@
+"""
+Guardado de archivos subidos (async, por bloques).
+
+- El archivo se copia a disco en bloques de 1 MB con anyio (sin bloquear el event loop
+  y sin cargar el archivo completo en memoria).
+- El tamaño se valida mientras se copia: al superar el límite se aborta con 413 y se
+  elimina el archivo parcial.
+- `uploads/` es temporal: después de procesar, SIEMPRE eliminar el archivo (ver ejemplo).
+
+Uso:
+    info = await save_upload(file, allowed_types=["image/png"], max_size_mb=2)
+    path = anyio.Path(info["path"])
+    try:
+        content = await path.read_bytes()
+        ...
+    finally:
+        await path.unlink(missing_ok=True)
+"""
+
+import re
 import uuid
 from pathlib import Path
+from typing import TypedDict
 
+import anyio
 from fastapi import UploadFile
 
-from app.core.environments import REQUEST_MAX_SIZE_MB
+from app.core.environment import settings
 from app.exceptions.AppHttpException import AppHttpException
 
-# Directorio temporal donde se almacenan los archivos subidos.
-# El developer decide qué hacer con ellos después (subir a bucket, procesar, etc.)
-# y debe eliminarlos manualmente una vez procesados.
-UPLOAD_DIR = Path("uploads")
+_CHUNK_SIZE = 1024 * 1024
+_SAFE_EXTENSION = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
+
+
+class UploadInfo(TypedDict):
+    filename: str
+    original_filename: str
+    content_type: str | None
+    size_bytes: int
+    size_mb: float
+    path: str
 
 
 async def save_upload(
@@ -17,99 +46,61 @@ async def save_upload(
     allowed_types: list[str] | None = None,
     max_size_mb: float | None = None,
     destination: Path | None = None,
-) -> dict:
+) -> UploadInfo:
     """
-    Guarda un archivo subido en el directorio de uploads y retorna su metadata.
-
-    El archivo queda en disco para que el developer lo procese (ej: subir a S3/GCS).
-    Se recomienda eliminarlo después de procesarlo.
+    Guarda un archivo subido y retorna su metadata.
 
     Args:
-        file:          Archivo recibido desde el endpoint (UploadFile de FastAPI).
-        allowed_types: Lista de MIME types permitidos.
-                       Ej: ["image/jpeg", "image/png", "application/pdf"]
-                       Si es None, se acepta cualquier tipo.
-        max_size_mb:   Tamaño máximo del archivo en MB.
-                       Si es None, se usa el límite global REQUEST_MAX_SIZE_MB
-                       como fallback de última instancia.
-        destination:   Carpeta destino. Si es None, usa UPLOAD_DIR ("uploads/").
-
-    Returns:
-        Dict con metadata del archivo guardado:
-        {
-            "filename":          "uuid-generado.jpg",
-            "original_filename": "foto.jpg",
-            "content_type":      "image/jpeg",
-            "size_bytes":        204800,
-            "size_mb":           0.1953,
-            "path":              "uploads/uuid-generado.jpg"
-        }
+        allowed_types: MIME types permitidos (el cliente los declara: validar el contenido
+                       si el tipo es crítico para la seguridad).
+        max_size_mb:   límite del archivo; por defecto REQUEST_MAX_SIZE_MB.
+        destination:   carpeta destino; por defecto UPLOAD_DIR.
 
     Raises:
-        AppHttpException 415: Tipo de archivo no permitido.
-        AppHttpException 413: Archivo supera el tamaño máximo.
-
-    Uso en un endpoint:
-        from fastapi import UploadFile, File
-        from app.utils.file_upload import save_upload
-
-        @router.post("/avatar")
-        async def upload_avatar(file: UploadFile = File(...)):
-            result = await save_upload(
-                file,
-                allowed_types=["image/jpeg", "image/png", "image/webp"],
-                max_size_mb=5,
-            )
-            # Aquí puedes subir result["path"] a S3, etc.
-            # Recuerda eliminar el archivo temporal después.
-            return result
+        AppHttpException 415 tipo no permitido · 413 archivo demasiado grande.
     """
-    # Validar tipo de archivo
     if allowed_types and file.content_type not in allowed_types:
         raise AppHttpException(
-            message=f"Tipo de archivo no permitido: {file.content_type}",
-            status_code=415,
-            context={
-                "allowed_types": allowed_types,
-                "received_type": file.content_type,
-            },
+            f"Tipo de archivo no permitido: {file.content_type}",
+            415,
+            {"allowed_types": allowed_types, "received_type": file.content_type},
+            code="unsupported_file_type",
         )
 
-    content = await file.read()
-    size_bytes = len(content)
+    limit_mb = max_size_mb if max_size_mb is not None else settings.REQUEST_MAX_SIZE_MB
+    max_bytes = int(limit_mb * 1024 * 1024)
+    if file.size is not None and file.size > max_bytes:
+        raise _too_large(limit_mb)
 
-    # Validar tamaño — usa el parámetro o cae al límite global del middleware
-    effective_max_mb = max_size_mb if max_size_mb is not None else REQUEST_MAX_SIZE_MB
-    max_bytes = effective_max_mb * 1024 * 1024
-
-    if size_bytes > max_bytes:
-        raise AppHttpException(
-            message=f"Archivo demasiado grande. Máximo permitido: {effective_max_mb}MB",
-            status_code=413,
-            context={
-                "max_mb": effective_max_mb,
-                "received_mb": round(size_bytes / 1024 / 1024, 4),
-            },
-        )
-
-    # Guardar en disco
-    upload_dir = destination or UPLOAD_DIR
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = anyio.Path(destination or settings.UPLOAD_DIR)
+    await upload_dir.mkdir(parents=True, exist_ok=True)
 
     original_name = file.filename or "file"
     extension = Path(original_name).suffix
-    unique_filename = f"{uuid.uuid4()}{extension}"
-    file_path = upload_dir / unique_filename
+    if not _SAFE_EXTENSION.fullmatch(extension):
+        extension = ""
+    unique_name = f"{uuid.uuid4().hex}{extension}"
+    target = upload_dir / unique_name
 
-    file_path.write_bytes(content)
+    size = 0
+    try:
+        async with await anyio.open_file(target, "wb") as out:
+            while chunk := await file.read(_CHUNK_SIZE):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise _too_large(limit_mb)
+                await out.write(chunk)
+    except BaseException:
+        await target.unlink(missing_ok=True)
+        raise
 
     return {
-        "filename": unique_filename,
+        "filename": unique_name,
         "original_filename": original_name,
         "content_type": file.content_type,
-        "size_bytes": size_bytes,
-        "size_mb": round(size_bytes / 1024 / 1024, 4),
-        "path": str(file_path),
+        "size_bytes": size,
+        "size_mb": round(size / 1024 / 1024, 4),
+        "path": str(target),
     }
 
 
@@ -118,37 +109,23 @@ async def save_uploads(
     allowed_types: list[str] | None = None,
     max_size_mb: float | None = None,
     destination: Path | None = None,
-) -> list[dict]:
-    """
-    Versión de save_upload para múltiples archivos simultáneos.
+) -> list[UploadInfo]:
+    """Varios archivos. Si uno falla, se eliminan los ya guardados y se relanza el error."""
+    saved: list[UploadInfo] = []
+    try:
+        for file in files:
+            saved.append(await save_upload(file, allowed_types, max_size_mb, destination))
+    except BaseException:
+        for info in saved:
+            await anyio.Path(info["path"]).unlink(missing_ok=True)
+        raise
+    return saved
 
-    Procesa cada archivo individualmente. Si alguno falla la validación,
-    lanza la excepción y los archivos ya guardados quedan en disco.
 
-    Args:
-        files:         Lista de archivos (UploadFile) recibidos del endpoint.
-        allowed_types: Ver save_upload.
-        max_size_mb:   Ver save_upload.
-        destination:   Ver save_upload.
-
-    Returns:
-        Lista de dicts con metadata de cada archivo guardado.
-
-    Uso en un endpoint:
-        from fastapi import UploadFile, File
-        from app.utils.file_upload import save_uploads
-
-        @router.post("/attachments")
-        async def upload_attachments(files: list[UploadFile] = File(...)):
-            results = await save_uploads(
-                files,
-                allowed_types=["application/pdf", "image/jpeg"],
-                max_size_mb=10,
-            )
-            return results
-    """
-    results = []
-    for file in files:
-        result = await save_upload(file, allowed_types, max_size_mb, destination)
-        results.append(result)
-    return results
+def _too_large(limit_mb: float) -> AppHttpException:
+    return AppHttpException(
+        f"Archivo demasiado grande. Máximo permitido: {limit_mb}MB",
+        413,
+        {"max_mb": limit_mb},
+        code="file_too_large",
+    )

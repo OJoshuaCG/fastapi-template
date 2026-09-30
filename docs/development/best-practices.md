@@ -1,626 +1,387 @@
 # Mejores Prácticas de Desarrollo
 
-Esta guía proporciona patrones, convenciones y mejores prácticas para desarrollar con esta plantilla FastAPI.
-
-## Estructura de Código
-
-### Organización de Endpoints
-
-```python
-# ✅ Correcto - Un archivo por recurso
-# app/routes/users.py
-from fastapi import APIRouter
-
-router = APIRouter(prefix="/users", tags=["Users"])
-
-@router.get("/")
-async def list_users():
-    pass
-
-@router.post("/")
-async def create_user():
-    pass
-
-@router.get("/{user_id}")
-async def get_user(user_id: int):
-    pass
-
-# ❌ Incorrecto - Todo en un archivo
-# app/routes/routes.py con 50 endpoints
-```
-
-### Separación de Responsabilidades (Patrón MVC)
-
-Este proyecto sigue un patrón **MVC sin Vista** (solo backend):
-
-**Routes → Controllers → Models → Database**
-
-```python
-# ✅ Correcto - Patrón MVC
-# app/controllers/user_controller.py
-from app.models.user_model import UserModel
-from app.exceptions import AppHttpException
-
-class UserController:
-    def __init__(self):
-        self.user_model = UserModel()
-
-    def create_user(self, user_data: dict):
-        # Lógica de negocio / validación
-        existing = self.user_model.find_by_username(user_data["username"])
-        if existing:
-            raise AppHttpException("Username ya existe", 409)
-
-        # Crear usuario a través del modelo
-        user_id = self.user_model.create(user_data)
-        return self.user_model.find_by_id(user_id)
-
-    def get_user(self, user_id: int):
-        user = self.user_model.find_by_id(user_id)
-        if not user:
-            raise AppHttpException("Usuario no encontrado", 404)
-        return user
-
-# app/routes/users.py
-from app.controllers.user_controller import UserController
-
-@router.post("/")
-async def create_user(user: UserCreate):
-    controller = UserController()
-    return controller.create_user(user.dict())
-
-@router.get("/{user_id}")
-async def get_user(user_id: int):
-    controller = UserController()
-    return controller.get_user(user_id)
-
-# ❌ Incorrecto - Lógica de negocio en endpoint
-@router.post("/")
-async def create_user(user: UserCreate):
-    # 50 líneas de lógica de negocio aquí
-    pass
-```
-
-### Model Pattern (Interacción con BD)
-
-```python
-# app/models/user_model.py
-from app.core.database import Database
-from app.core.environments import DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_PORT
-
-class UserModel:
-    def __init__(self):
-        self.db = Database(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
-
-    def find_by_id(self, user_id: int):
-        """Buscar usuario por ID"""
-        return self.db.execute_query(
-            "SELECT * FROM users WHERE id = :id",
-            {"id": user_id},
-            fetchone=True
-        )
-
-    def find_by_username(self, username: str):
-        """Buscar usuario por username"""
-        return self.db.execute_query(
-            "SELECT * FROM users WHERE username = :username",
-            {"username": username},
-            fetchone=True
-        )
-
-    def create(self, user_data: dict):
-        """Crear nuevo usuario"""
-        return self.db.execute_query(
-            "INSERT INTO users (username, email, hashed_password) "
-            "VALUES (:username, :email, :password)",
-            user_data
-        )
-
-    def update(self, user_id: int, user_data: dict):
-        """Actualizar usuario"""
-        return self.db.execute_query(
-            "UPDATE users SET email = :email WHERE id = :id",
-            {"id": user_id, **user_data}
-        )
-
-    def delete(self, user_id: int):
-        """Eliminar usuario"""
-        return self.db.execute_query(
-            "DELETE FROM users WHERE id = :id",
-            {"id": user_id}
-        )
-```
-
-## Validación de Datos
-
-### Usar Pydantic Models con ApiResponse
-
-Siempre usa `ApiResponse[T]` como `response_model` para consistencia:
-
-```python
-# app/schemas/user.py
-from pydantic import BaseModel, EmailStr, Field
-
-class UserCreate(BaseModel):
-    username: str = Field(..., min_length=3, max_length=50)
-    email: EmailStr
-    password: str = Field(..., min_length=8)
-    full_name: str | None = None
-
-class UserOut(BaseModel):
-    id: int
-    username: str
-    email: str
-    is_active: bool
-
-    model_config = {"from_attributes": True}
-
-# app/routes/users.py
-from app.utils.response import ApiResponse, success, empty
-
-@router.post("/", response_model=ApiResponse[UserOut], status_code=201)
-async def create_user(user: UserCreate):
-    result = controller.create_user(user.model_dump())
-    return success(data=result, message="Usuario creado")
-
-@router.delete("/{user_id}", response_model=ApiResponse[None])
-async def delete_user(user_id: int):
-    controller.delete_user(user_id)
-    return empty("Usuario eliminado exitosamente")
-```
-
-### Validación Personalizada
-
-```python
-from pydantic import BaseModel, validator
-
-class UserCreate(BaseModel):
-    username: str
-    password: str
-    password_confirm: str
-
-    @validator('username')
-    def username_alphanumeric(cls, v):
-        if not v.isalnum():
-            raise ValueError('Username debe ser alfanumérico')
-        return v
-
-    @validator('password_confirm')
-    def passwords_match(cls, v, values):
-        if 'password' in values and v != values['password']:
-            raise ValueError('Passwords no coinciden')
-        return v
-```
-
-## Manejo de Errores
-
-### Siempre Usar AppHttpException
-
-```python
-# ✅ Correcto
-from app.exceptions import AppHttpException
-
-if not user:
-    raise AppHttpException(
-        message="Usuario no encontrado",
-        status_code=404,
-        context={"user_id": user_id}
-    )
-
-# ❌ Incorrecto
-from fastapi import HTTPException
-raise HTTPException(status_code=404, detail="Not found")
-```
-
-### Try-Except Específico
-
-```python
-# ✅ Correcto
-try:
-    result = int(value)
-except ValueError:
-    raise AppHttpException("Valor debe ser numérico", 400)
-except Exception as e:
-    logger.error(f"Error inesperado: {str(e)}")
-    raise AppHttpException("Error interno", 500)
-
-# ❌ Incorrecto
-try:
-    result = int(value)
-except:
-    raise AppHttpException("Error", 500)
-```
-
-## Logging
-
-### Siempre Incluir Request ID
-
-```python
-from app.core.logger import get_logger
-from app.core.context import current_http_identifier
-
-logger = get_logger(__name__)
-
-@router.post("/users")
-async def create_user(user: UserCreate):
-    request_id = current_http_identifier.get()
-    logger.info(f"{request_id} | Creando usuario: {user.username}")
-    # ...
-    logger.info(f"{request_id} | Usuario creado: ID {user_id}")
-```
-
-### Niveles Apropiados
-
-```python
-# INFO - Operaciones normales
-logger.info(f"{request_id} | Usuario autenticado: {username}")
-
-# WARNING - Situaciones inusuales
-logger.warning(f"{request_id} | Intento de login fallido: {username}")
-
-# ERROR - Errores que impiden completar operación
-logger.error(f"{request_id} | Error en pago: {str(e)}")
-
-# DEBUG - Información detallada (solo desarrollo)
-logger.debug(f"{request_id} | Query SQL: {query}")
-```
-
-## Base de Datos
-
-### Usar Parámetros (SQL Injection)
-
-```python
-# ✅ Correcto
-db.execute_query(
-    "SELECT * FROM users WHERE id = :id",
-    {"id": user_id}
-)
-
-# ❌ NUNCA hacer esto
-db.execute_query(f"SELECT * FROM users WHERE id = {user_id}")
-```
-
-### Cerrar Sesiones ORM
-
-```python
-# ✅ Correcto
-session = db.get_declarative_base_session()
-try:
-    user = session.query(User).first()
-finally:
-    session.close()
-
-# ❌ Incorrecto
-session = db.get_declarative_base_session()
-user = session.query(User).first()
-# Session nunca se cierra
-```
-
-### Transacciones
-
-```python
-# ✅ Correcto
-try:
-    user = User(...)
-    session.add(user)
-
-    post = Post(author_id=user.id, ...)
-    session.add(post)
-
-    session.commit()  # Un solo commit
-except Exception as e:
-    session.rollback()
-    raise
-finally:
-    session.close()
-```
-
-## Seguridad
-
-### No Hardcodear Secretos
-
-```python
-# ❌ NUNCA hacer esto
-SECRET_KEY = "mi_clave_super_secreta"
-API_KEY = "sk_live_123abc"
-
-# ✅ Correcto
-from app.core.environments import SECRET_KEY, API_KEY
-```
-
-### Hashear Passwords
-
-```bash
-uv add passlib[bcrypt]
-```
-
-```python
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# Hashear
-hashed = pwd_context.hash(plain_password)
-
-# Verificar
-is_valid = pwd_context.verify(plain_password, hashed)
-```
-
-### Validar Permisos
-
-```python
-from app.core.context import current_user_id
-
-@router.delete("/posts/{post_id}")
-async def delete_post(post_id: int):
-    current_user = current_user_id.get()
-
-    if not current_user:
-        raise AppHttpException("No autenticado", 401)
-
-    post = get_post(post_id)
-
-    if post.author_id != current_user:
-        raise AppHttpException("Sin permisos", 403)
-
-    # Eliminar post
-```
-
-## Performance
-
-### Evitar N+1 Queries
-
-```python
-# ❌ Incorrecto (N+1 queries)
-posts = db.execute_query("SELECT * FROM posts", fetchone=False)
-for post in posts:
-    author = db.execute_query(
-        "SELECT * FROM users WHERE id = :id",
-        {"id": post["author_id"]},
-        fetchone=True
-    )
-    post["author"] = author
-
-# ✅ Correcto (1 query con JOIN)
-posts = db.execute_query("""
-    SELECT
-        p.*,
-        u.username as author_username,
-        u.email as author_email
-    FROM posts p
-    JOIN users u ON p.author_id = u.id
-""", fetchone=False)
-```
-
-### Paginación
-
-Usa `PaginationDep` y `paginated()` para respuestas consistentes:
-
-```python
-from app.utils.pagination import PaginationDep
-from app.utils.response import ApiResponse, paginated
-
-@router.get("/users", response_model=ApiResponse[list[UserOut]])
-async def list_users(pagination: PaginationDep):
-    users = model.find_all(limit=pagination.size, offset=pagination.offset)
-    total = model.count()
-    return paginated(users, total=total, pagination=pagination)
-```
-
-Ver [Paginación](../features/pagination.md) para documentación completa.
-
-### Caché
-
-```bash
-uv add aiocache
-```
-
-```python
-from aiocache import cached
-
-@cached(ttl=300)  # Cache por 5 minutos
-async def get_user_stats(user_id: int):
-    return db.execute_query(
-        "SELECT COUNT(*) as posts FROM posts WHERE author_id = :id",
-        {"id": user_id},
-        fetchone=True
-    )
-```
-
-## Testing
-
-### Instalar Dependencias de Testing
-
-```bash
-uv add --group dev pytest pytest-asyncio httpx
-```
-
-### Crear Tests
-
-```python
-# tests/test_users.py
-from fastapi.testclient import TestClient
-from main import app
-
-client = TestClient(app)
-
-def test_create_user():
-    response = client.post("/users", json={
-        "username": "testuser",
-        "email": "test@example.com",
-        "password": "password123"
-    })
-
-    assert response.status_code == 201
-    assert response.json()["username"] == "testuser"
-
-def test_get_user_not_found():
-    response = client.get("/users/999999")
-
-    assert response.status_code == 404
-    assert "no encontrado" in response.json()["detail"]["msg"].lower()
-```
-
-### Ejecutar Tests
-
-```bash
-uv run pytest
-
-# Con coverage
-uv run pytest --cov=app --cov-report=html
-```
-
-## Git Workflow
-
-### Commits Semánticos
-
-```bash
-# feat: Nueva funcionalidad
-git commit -m "feat: agregar endpoint de autenticación"
-
-# fix: Corrección de bug
-git commit -m "fix: corregir validación de email"
-
-# docs: Documentación
-git commit -m "docs: actualizar README con ejemplos"
-
-# refactor: Refactorización
-git commit -m "refactor: extraer lógica de usuario a service"
-
-# test: Tests
-git commit -m "test: agregar tests de autenticación"
-
-# chore: Mantenimiento
-git commit -m "chore: actualizar dependencias"
-```
-
-### Branches
-
-```bash
-# Feature branch
-git checkout -b feature/user-authentication
-
-# Bugfix branch
-git checkout -b fix/password-validation
-
-# Hotfix branch (producción)
-git checkout -b hotfix/critical-security-fix
-```
-
-## Variables de Entorno
-
-### Desarrollo vs Producción
-
-```env
-# .env.development
-APP_ENV=development
-LOGGER_LEVEL=DEBUG
-LOGGER_MIDDLEWARE_SHOW_HEADERS=True
-
-# .env.production
-APP_ENV=production
-LOGGER_LEVEL=WARNING
-LOGGER_MIDDLEWARE_SHOW_HEADERS=False
-```
-
-### Cargar según Entorno
-
-```python
-# config.py
-import os
-from dotenv import load_dotenv
-
-env = os.getenv("ENV", "development")
-load_dotenv(f".env.{env}")
-```
-
-## Documentación
-
-### Docstrings
-
-```python
-def create_user(username: str, email: str) -> dict:
-    """
-    Crea un nuevo usuario en la base de datos.
-
-    Args:
-        username: Nombre de usuario único (3-50 caracteres)
-        email: Email válido del usuario
-
-    Returns:
-        dict: Usuario creado con id, username, email
-
-    Raises:
-        AppHttpException: Si el username ya existe (409)
-        AppHttpException: Si hay error en BD (500)
-
-    Example:
-        >>> user = create_user("john", "john@example.com")
-        >>> print(user["id"])
-        1
-    """
-    pass
-```
-
-### OpenAPI/Swagger
-
-```python
-@router.post(
-    "/",
-    response_model=UserResponse,
-    status_code=201,
-    summary="Crear usuario",
-    description="Crea un nuevo usuario en el sistema",
-    responses={
-        201: {"description": "Usuario creado exitosamente"},
-        409: {"description": "Username o email ya existe"},
-        422: {"description": "Datos de entrada inválidos"}
-    }
-)
-async def create_user(user: UserCreate):
-    pass
-```
-
-## Monitoreo
-
-### Health Check Endpoint
-
-```python
-@router.get("/health")
-async def health_check():
-    # Verificar BD
-    try:
-        db.execute_query("SELECT 1", fetchone=True)
-        db_status = "ok"
-    except:
-        db_status = "error"
-
-    return {
-        "status": "ok" if db_status == "ok" else "degraded",
-        "database": db_status,
-        "version": "1.0.0"
-    }
-```
-
-### Metrics Endpoint
-
-```python
-@router.get("/metrics")
-async def metrics():
-    return {
-        "uptime": get_uptime(),
-        "requests_total": request_counter,
-        "requests_per_second": calculate_rps(),
-        "db_connections": get_db_pool_size()
-    }
-```
-
-## Recursos
-
-- [FastAPI Best Practices](https://fastapi.tiangolo.com/tutorial/)
-- [Pydantic Documentation](https://docs.pydantic.dev/)
-- [Python Best Practices](https://docs.python-guide.org/)
+La plantilla es **100% async**: un solo hilo por worker atiende todas las requests. Cualquier llamada bloqueante dentro de un `async def` congela el worker completo (incluido `/health`). La mayoría de estas reglas existen para evitar eso.
 
 ---
 
-**Siguiente**: [Despliegue](../deployment.md)
+## 1. Async: nunca bloquear el event loop
+
+### Prohibido dentro de `async def`
+
+| Bloqueante | Alternativa async |
+|---|---|
+| `requests`, `urllib`, `httpx.Client` | Un service que hereda de `ServiceClient` (`app/services/`) |
+| `time.sleep()` | `await asyncio.sleep()` |
+| Drivers síncronos (`pymysql`, `mysqlclient`, `psycopg2`) | `Database` (SQLAlchemy async + `asyncmy`) |
+| `open()`, `Path.read_bytes()`, `shutil` | `anyio.Path`, `anyio.open_file` |
+| CPU pesado (hash, pandas, PIL, PDF) o SDKs síncronos | `await anyio.to_thread.run_sync(func, ...)` |
+
+```python
+# ❌ Bloquea el worker entero mientras espera
+@router.get("/rates")
+async def rates():
+    return requests.get("https://api.externa.com/rates").json()
+
+# ✅ I/O async a través de un service (app/services/rates_service.py)
+class RatesService(ServiceClient):
+    name = "rates"
+    base_url = "https://api.rates.example"
+
+    async def current(self) -> dict:
+        return await self.get_json("/rates")
+
+@router.get("/rates", response_model=ApiResponse[dict])
+async def rates(rates: RatesServiceDep):   # en un proyecto real: a través del controller
+    return success(data=await rates.current())
+```
+
+Ruff tiene activas las reglas `ASYNC` (detecta `time.sleep`, `open`, `requests`... dentro de `async def`) y corre en pre-commit.
+
+### Trabajo de CPU en un thread
+
+La función síncrona se ejecuta con `anyio.to_thread.run_sync` y el endpoint solo la espera:
+
+```python
+from anyio import CapacityLimiter, to_thread
+
+_limiter = CapacityLimiter(4)            # máx. 4 simultáneos si cada uno usa mucha memoria
+
+async def build_report(data: list[dict]) -> bytes:
+    return await to_thread.run_sync(_render_pdf_sync, data, limiter=_limiter)
+```
+
+Con trabajo de CPU que usa mucha memoria, acotar la concurrencia con un `CapacityLimiter` propio.
+
+### Cliente HTTP: un pool por servicio externo
+
+Crear un `httpx.AsyncClient` por request agota file descriptors y paga un handshake TLS en cada llamada.
+Cada integración es un service que hereda de `ServiceClient`: su pool se crea en el primer uso, se reutiliza
+y se cierra en el lifespan (`close_all()`). Pools separados: un proveedor lento no agota las conexiones de
+otro. Ver [services](../features/services.md).
+
+### `asyncio.create_task` necesita una referencia
+
+El event loop guarda solo referencias débiles a las tareas: una tarea sin referencia puede ser recolectada a mitad de ejecución (Ruff `RUF006`).
+
+```python
+# ❌
+asyncio.create_task(send_email(user))
+
+# ✅
+_background: set[asyncio.Task] = set()
+
+task = asyncio.create_task(send_email(user))
+_background.add(task)
+task.add_done_callback(_background.discard)
+```
+
+Para trabajo que debe sobrevivir a la request o reintentarse, usar una cola (no tareas sueltas).
+
+### Timeouts en todo I/O externo
+
+```python
+async with asyncio.timeout(5):
+    await servicio_lento()
+```
+
+La BD ya tiene `DB_POOL_TIMEOUT`, `DB_CONNECT_TIMEOUT` y `DB_STATEMENT_TIMEOUT`; el cliente HTTP, `HTTP_CLIENT_TIMEOUT`.
+
+### Detectar bloqueos del event loop
+
+**Prevención (ya activa):** Ruff con las reglas `ASYNC` detecta llamadas bloqueantes dentro de `async def` (`time.sleep`, `open`, `requests`...), y pytest trata `RuntimeWarning` como error, así que una corrutina sin `await` hace fallar el test.
+
+**En desarrollo:** el modo debug de asyncio registra cada callback que tarda más que `loop.slow_callback_duration` (default 100 ms), con la tarea que lo causó:
+
+```bash
+PYTHONASYNCIODEBUG=1 uv run fastapi dev
+# WARNING asyncio: Executing <Task ... coro=<get_user() ...>> took 0.312 seconds
+```
+
+Solo para desarrollo: el modo debug agrega overhead.
+
+**En producción:** `py-spy dump --pid <pid>` muestra el stack de cada thread en ese instante, sin tocar el código ni reiniciar (desde el host o dentro del contenedor, con permisos de `ptrace`). Si el worker está congelado, el stack señala al culpable. Si se necesita monitoreo continuo, usar una librería como [aiodebug](https://pypi.org/project/aiodebug/).
+
+El template no incluye un monitor de lag del event loop a propósito: es poco común en plantillas y un monitor casero solo detecta *que* el loop se retrasó, no puede identificar de forma confiable *qué* lo bloqueó.
+
+---
+
+## 2. Base de Datos
+
+### Parámetros siempre enlazados
+
+```python
+# ✅
+await self.db.fetch_one("SELECT ... FROM users WHERE id = :id", {"id": user_id})
+
+# ❌ SQL injection
+await self.db.fetch_one(f"SELECT ... FROM users WHERE id = {user_id}")
+```
+
+### Nombres de columna dinámicos: solo desde whitelist
+
+Los valores van como parámetros, pero los identificadores (columnas, ORDER BY) no se pueden parametrizar. Validarlos contra un conjunto fijo, como `UserModel.update`:
+
+```python
+_UPDATABLE_COLUMNS = frozenset({"email", "full_name", "notes", "is_active", "is_superuser", "encrypted_password"})
+
+async def update(self, user_id: int, data: dict[str, Any]) -> int:
+    unknown = set(data) - _UPDATABLE_COLUMNS
+    if unknown:
+        raise AppHttpException("Campos no permitidos", 422, {"fields": sorted(unknown)}, code="invalid_fields")
+    set_clause = ", ".join(f"{col} = :{col}" for col in data)  # col ∈ whitelist
+    result = await self.db.execute(f"UPDATE users SET {set_clause} WHERE id = :id", {**data, "id": user_id})
+    return result.rowcount
+```
+
+### No compartir una conexión en `asyncio.gather`
+
+Una conexión ejecuta una sentencia a la vez. Sin `conn=`, cada helper toma su propia conexión del pool, así que `gather` es seguro; con una transacción compartida, las sentencias van en secuencia.
+
+```python
+# ✅ Conexiones independientes (cada helper toma y devuelve la suya)
+items, total = await asyncio.gather(model.find_all(limit=20, offset=0), model.count())
+
+# ❌ La misma conexión en paralelo
+async with db.transaction() as tx:
+    await asyncio.gather(db.execute(a, conn=tx), db.execute(b, conn=tx))
+
+# ✅ Dentro de una transacción: secuencial
+async with db.transaction() as tx:
+    await db.execute("UPDATE accounts SET ...", {...}, conn=tx)
+    await db.execute("INSERT INTO movements ...", {...}, conn=tx)
+```
+
+Tener en cuenta que `gather` usa varias conexiones del pool por request.
+
+### No mantener una conexión mientras se espera I/O externo
+
+Una transacción abierta durante una llamada HTTP retiene la conexión (y los locks) todo ese tiempo; con carga, el pool se agota y las demás requests reciben 503.
+
+```python
+# ❌
+async with db.transaction() as tx:
+    order = await db.fetch_one("SELECT ... FOR UPDATE", {...}, conn=tx)
+    await http.post("https://pagos.externo/charge", json=order)   # conexión retenida
+    await db.execute("UPDATE orders SET paid = 1 ...", {...}, conn=tx)
+
+# ✅ Leer → llamar afuera → escribir en una transacción corta
+order = await model.find_by_id(order_id)
+charge = await http.post("https://pagos.externo/charge", json=order)
+await model.mark_paid(order_id, charge.json()["id"])
+```
+
+### Dejar que la BD decida la unicidad
+
+No hacer `SELECT` para ver si existe antes de insertar (carrera TOCTOU). El índice `UNIQUE` decide y `Database` traduce el duplicado a 409 (`reason="duplicate"`), como en `UserController.create_user`.
+
+### Sin columnas sensibles en las respuestas
+
+Las consultas que terminan en una respuesta seleccionan columnas explícitas (ver `_PUBLIC_COLUMNS` en `UserModel`), nunca `encrypted_password`.
+
+---
+
+## 3. Estructura MVC e inyección
+
+```python
+# app/models/post_model.py
+class PostModel:
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def find_by_id(self, post_id: int) -> dict | None:
+        return await self.db.fetch_one("SELECT id, title FROM posts WHERE id = :id", {"id": post_id})
+
+def get_post_model(db: DatabaseDep) -> PostModel:
+    return PostModel(db)
+
+PostModelDep = Annotated[PostModel, Depends(get_post_model)]
+```
+
+```python
+# app/controllers/post_controller.py
+class PostController:
+    def __init__(self, posts: PostModel):
+        self.posts = posts
+
+    async def get_post(self, post_id: int) -> dict:
+        post = await self.posts.find_by_id(post_id)
+        if not post:
+            raise AppHttpException("Post no encontrado", 404, {"post_id": post_id}, code="post_not_found")
+        return post
+
+def get_post_controller(posts: PostModelDep) -> PostController:
+    return PostController(posts)
+
+PostControllerDep = Annotated[PostController, Depends(get_post_controller)]
+```
+
+```python
+# app/routes/v1/posts.py
+@router.get("/{post_id}", response_model=ApiResponse[PostOut])
+async def get_post(post_id: int, posts: PostControllerDep):
+    return success(data=await posts.get_post(post_id))
+```
+
+Registrar el router en `build_v1_router()` (`app/routes/v1/routes.py`). Sin lógica de negocio en las routes ni SQL en los controllers.
+
+---
+
+## 4. Respuestas y Errores
+
+### Siempre `ApiResponse[T]`
+
+```python
+# ✅
+@router.get("/{user_id}", response_model=ApiResponse[UserOut])
+async def get_user(user_id: int, users: UserControllerDep):
+    return success(data=await users.get_user(user_id))
+
+# ❌ Rompe el formato estándar
+@router.get("/{user_id}")
+async def get_user(user_id: int):
+    return {"id": 1}
+```
+
+### Siempre `AppHttpException`
+
+```python
+# ✅
+raise AppHttpException("El email ya está en uso", 409, code="user_conflict")
+
+# ❌
+raise HTTPException(status_code=409, detail="conflict")
+```
+
+- `message`: texto seguro para el usuario final. Nunca `str(e)`.
+- `code` / `reason`: identificadores estables para el frontend.
+- `context`: datos de depuración (solo logs y development). Nunca el body completo (PII).
+- Encadenar la causa: `raise AppHttpException(...) from e`.
+
+### Capturar excepciones específicas
+
+```python
+# ✅
+try:
+    user_id = await self.users.create(data)
+except AppHttpException as e:
+    if e.reason == "duplicate":
+        raise AppHttpException("El username o email ya está en uso", 409, code="user_conflict") from e
+    raise
+
+# ❌ Oculta el error real y devuelve un 500 genérico sin traza útil
+try:
+    ...
+except Exception:
+    pass
+```
+
+Los errores no controlados los registra `generic_exception_handler` una sola vez con traceback; no hace falta loguearlos a mano.
+
+---
+
+## 5. Validación
+
+Schemas en `app/schemas/` con `extra="forbid"` para rechazar campos desconocidos:
+
+```python
+class UserCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=3, max_length=50, pattern=r"^[A-Za-z0-9_.-]+$")
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+```
+
+En updates parciales usar `payload.model_dump(exclude_unset=True)`.
+
+Estilo FastAPI/Pydantic moderno: `Field(min_length=...)` sin `...`; parámetros con `Annotated` en vez de defaults (`is_active: Annotated[bool | None, Query()] = None`, `file: Annotated[UploadFile, File()]`, `PaginationDep`, `UserControllerDep`); `status_code=status.HTTP_201_CREATED` en vez de `201`.
+
+---
+
+## 6. Rate Limiting
+
+```python
+from app.core.environment import settings
+from app.core.rate_limit import rate_limit
+
+@router.post("/login", dependencies=[rate_limit(settings.RATE_LIMIT_LOGIN)])  # leído al importar
+async def login(...): ...
+```
+
+El límite global por IP lo aplica nginx (`limit_req`); en la app solo se limitan rutas concretas. Con más de un worker o réplica, usar Redis (`RATE_LIMIT_REDIS_ENABLED=True`, `uv sync --extra redis`): en memoria cada worker cuenta por separado.
+
+El rate limit de la app es una dependencia y FastAPI la resuelve **después** de leer el body: no frena bodies grandes. El límite duro es `limit_req` de nginx (+ `RequestSizeMiddleware`).
+
+---
+
+## 7. Logging
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+logger.info("Pedido %s creado", order_id)           # el request_id se agrega solo
+logger.warning("Proveedor lento: %.1fs", elapsed)
+```
+
+- No agregar el Request ID a mano: `logging_config` lo inyecta en cada línea.
+- Usar `%s` (lazy) en lugar de f-strings en logs.
+- Nunca loguear contraseñas, tokens ni bodies completos. `Authorization`, `Cookie` y cualquier header con nombre sensible (`is_sensitive_key`) se enmascaran solos en el LoggerMiddleware.
+- `LOG_FORMAT=json` para agregadores (Loki, ELK, Datadog).
+
+---
+
+## 8. Seguridad
+
+- Secretos solo por variables de entorno (`Settings` con `SecretStr`); `detect-secrets` corre en pre-commit.
+- Contraseñas cifradas de forma reversible (`encrypt_password()` / `verify_password()` / `reveal_password()` de `app/utils/passwords.py`) con `ENCRYPTION_KEYS`; la llave se guarda y respalda fuera de la BD. Ver [security](../features/security.md).
+- Un secreto por propósito: `SECRET_KEY`, `ENCRYPTION_KEYS`, `ENCODING_ALPHABET`, `DB_PASS` (en producción deben ser distintos).
+- IDs públicos con `EncodedId`/`EncodedIdOut` (ofuscación, no autorización).
+- En producción la app no arranca con `SECRET_KEY` < 32 caracteres, `DB_PASS` débil, `CORS_ORIGINS=*` o `ENCODING_ALPHABET` por defecto; en staging y producción, tampoco sin `ENCRYPTION_KEYS` o con `DOCS_PASSWORD` débil (docs protegidos). `SECRET_KEY` está reservado para la auth del proyecto.
+- Uploads: `save_upload()` valida tipo y tamaño mientras copia; el MIME lo declara el cliente, validar el contenido si es crítico. Eliminar siempre el temporal en `finally`.
+
+---
+
+## 9. Testing
+
+```bash
+docker compose -f docker-compose.test.yml up -d --wait
+uv run pytest
+```
+
+- Tests contra MariaDB real (no SQLite: SQL directo, SP, `SIGNAL` y collations son específicos de MariaDB/MySQL).
+- Marcar con `pytestmark = pytest.mark.db` los tests que usan BD (se omiten solos si no hay BD).
+- `asyncio_mode = "auto"`: los tests `async def` no necesitan decorador.
+- Un `RuntimeWarning` (corrutina sin `await`) hace fallar el test, igual que cualquier `DeprecationWarning`, `FastAPIDeprecationWarning`, `StarletteDeprecationWarning` o `UvicornDeprecationWarning` (`filterwarnings` en `pyproject.toml`).
+- `ENV_FILE=""` en `tests/conftest.py`: el `.env` local no afecta a los tests.
+- Reemplazar dependencias sobre la sub-app: `v1_app.dependency_overrides[get_user_controller] = ...` (fixture `v1_app`).
+
+```python
+pytestmark = pytest.mark.db
+
+async def test_get_user_404(client: httpx2.AsyncClient) -> None:
+    response = await client.get("/api/v1/users/999999")
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "user_not_found"
+```
+
+---
+
+## 10. Git y calidad
+
+```bash
+uv run --with pre-commit pre-commit install
+uv run ruff check . && uv run ruff format --check .
+```
+
+Commits semánticos: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`.
+
+---
+
+## Recursos
+
+- [FastAPI: async y concurrencia](https://fastapi.tiangolo.com/async/)
+- [SQLAlchemy asyncio](https://docs.sqlalchemy.org/en/21/orm/extensions/asyncio.html)
+- [AnyIO: threads](https://anyio.readthedocs.io/en/stable/threads.html)
+- [Ruff: reglas ASYNC](https://docs.astral.sh/ruff/rules/#flake8-async-async)
