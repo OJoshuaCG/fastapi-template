@@ -43,6 +43,7 @@ uv-cache/
 
 # === Testing & Coverage ===
 .coverage
+htmlcov/
 .coverage.*
 .cache
 nosetests.xml
@@ -80,3 +81,5 @@ Thumbs.db
 .secrets.baseline
 
 .claude/
+# Caché local del registro de skills de la herramienta de IA (se regenera)
+.atl/

@@ -21,6 +21,10 @@ __pycache__/
 
 # ── Herramientas de desarrollo ────────────────────────────────────────────────
 .claude/
+.atl/
+.agents/
+AGENTS.md
+CLAUDE.md
 .ruff_cache/
 .pytest_cache/
 .idea/
