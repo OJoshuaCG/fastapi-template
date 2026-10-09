@@ -28,8 +28,11 @@ dev = [
     "asgi-lifespan>=2.1.0",
     "detect-secrets>=1.5.0",
     "httpx2>=2.13.1",
+    "pip-audit>=2.10.1",
+    "pyright>=1.1.414",
     "pytest>=8.4",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
     "redis>=5.2",
     "ruff>=0.16.0",
 ]
@@ -64,6 +67,27 @@ extend-immutable-calls = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106", "S311"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pyright: `uv run pyright` (Ruff no verifica tipos, solo estilo y errores comunes)
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.pyright]
+include = ["app", "main.py"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cobertura: `uv run pytest --cov` (sin umbral mínimo: se mide, no se exige)
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pytest
