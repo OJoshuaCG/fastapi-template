@@ -21,7 +21,7 @@ Todas las respuestas de error (handlers de excepciones y middlewares) salen de u
 Un 500 no controlado en development agrega además `loc`:
 
 ```json
-"loc": {"file": "app/routes/v1/test.py", "function": "unhandled_error", "line": 56, "code": "…"}
+"loc": {"file": "app/routes/v1/test.py", "function": "unhandled_error", "line": 58, "code": "…"}
 ```
 
 | Campo | Presencia | Descripción |
@@ -136,14 +136,14 @@ FastAPI responde por defecto un 422 en inglés que incluye `input` (el valor env
 - **4xx** de `AppHttpException` y 422: solo con `LOGGER_EXCEPTIONS_ENABLED=True`. Los 422 registran únicamente los nombres de los campos.
 
 ```
-... [ERROR] app.exceptions.HandlerExceptions [a1b2c3d4e5f6a7b8] 10.0.0.5 | POST /api/v1/test/unhandled-error | 500 | RuntimeError: Error no controlado de ejemplo | app/routes/v1/test.py:56 en unhandled_error()
+... [ERROR] app.exceptions.HandlerExceptions [a1b2c3d4e5f6a7b8] 10.0.0.5 | POST /api/v1/test/unhandled-error | 500 | RuntimeError: Error no controlado de ejemplo | app/routes/v1/test.py:58 en unhandled_error()
 ```
 
 ## Errores emitidos por el template
 
 | `code` | Status | Origen |
 |---|---|---|
-| `validation_error` | 422 | Validación de Pydantic |
+| `validation_error` | 422 | Validación de Pydantic. En query params de listados, `errors[].type` usa los tipos del [contrato de la API](../development/api-contract.md) (`extra_forbidden`, `invalid_sort`, `invalid_range`, `date_filter_*`) |
 | `rate_limited` | 429 | `rate_limit()` |
 | `db_unavailable` (`pool_exhausted` / `connection_lost`) | 503 | Base de datos |
 | `db_timeout` (`statement_timeout`) | 504 | Base de datos |
@@ -152,7 +152,10 @@ FastAPI responde por defecto un 422 en inglés que incluye `input` (el valor env
 | `db_error` | 500 | Base de datos |
 | `unsupported_file_type` | 415 | `save_upload()` |
 | `file_too_large` | 413 | `save_upload()` |
-| `user_not_found`, `user_conflict`, `invalid_fields` | 404 / 409 / 422 | Ejemplo de usuarios |
+| `external_service_unavailable` (`pool_exhausted` / `connection_error` / `upstream_429` / `upstream_503`) | 503 | `ServiceClient` |
+| `external_service_timeout` (`timeout`) | 504 | `ServiceClient` |
+| `external_service_error` (`upstream_auth` / `upstream_<status>` / `invalid_json`) | 502 | `ServiceClient` |
+| `user_not_found`, `user_conflict` | 404 / 409 | Ejemplo de usuarios |
 
 ## Errores desde un middleware ASGI
 

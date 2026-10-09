@@ -123,6 +123,7 @@ Si la BD no está disponible al arrancar, la app **igual inicia** (se registra u
 | `/api/v1/docs` | Swagger UI |
 | `GET /api/v1/test/ping` | `{"data": {"message": "pong!"}}` |
 | `POST /api/v1/users` | Crea un usuario de ejemplo |
+| `GET /api/v1/users?sort=username&q=ana` | Listado paginado con orden y búsqueda (`?foo=1` → 422: parámetro desconocido) |
 
 ```bash
 curl -s http://localhost:8000/ready
@@ -140,8 +141,10 @@ docker compose -f docker-compose.test.yml up -d --wait   # MariaDB de test en 12
 uv run pytest
 docker compose -f docker-compose.test.yml down
 
-uv run ruff check .
-uv run ruff format .
+uv run ruff check . && uv run ruff format --check .      # lint y formato (sin reescribir)
+uv run pyright                                           # tipos (Ruff no verifica tipos)
+uv run pytest --cov                                      # cobertura de app/ (se mide, sin umbral)
+uv run pip-audit                                         # vulnerabilidades en dependencias
 
 uv run --with pre-commit pre-commit install              # hooks: ruff, detect-secrets
 ```
@@ -176,7 +179,7 @@ Ejecutar siempre desde la raíz del proyecto con `uv run`.
 
 ### `Table '...users' doesn't exist`
 
-Falta aplicar los scripts de `database/init/` (ver "Crear el esquema"). En Docker, los scripts solo corren con un volumen vacío: `docker compose down -v` en local, o aplicarlos a mano con `mariadb ... < database/init/NNN_x.sql`.
+Falta aplicar los scripts de `database/init/` (ver "Crear el esquema"). El compose tampoco los ejecuta (la base arranca vacía): aplicarlos con el gestor de BD o con `mariadb ... < database/init/NNN_x.sql`.
 
 ### Puerto 8000 en uso
 
@@ -188,7 +191,8 @@ uv run fastapi dev --port 8001
 ## Próximos Pasos
 
 1. [Estructura del Proyecto](project-structure.md)
-2. [Mejores Prácticas (async)](development/best-practices.md)
+2. [Reglas de programación](development/README.md) y [Mejores Prácticas (async)](development/best-practices.md)
 3. [Base de Datos](features/database.md)
 4. [Respuestas Estándar](features/response-format.md) y [Excepciones](features/exceptions.md)
 5. [Despliegue con Docker](docker-deployment.md)
+6. [Iniciar un proyecto desde la plantilla](development/starting-new-project.md)

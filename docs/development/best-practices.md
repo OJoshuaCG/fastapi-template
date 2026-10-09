@@ -2,6 +2,8 @@
 
 La plantilla es **100% async**: un solo hilo por worker atiende todas las requests. Cualquier llamada bloqueante dentro de un `async def` congela el worker completo (incluido `/health`). La mayoría de estas reglas existen para evitar eso.
 
+Este documento explica el **porqué** y cómo diagnosticar problemas. Las reglas imperativas viven en [docs/development/](README.md); aquí no se repiten.
+
 ---
 
 ## 1. Async: nunca bloquear el event loop
@@ -127,7 +129,8 @@ _UPDATABLE_COLUMNS = frozenset({"email", "full_name", "notes", "is_active", "is_
 async def update(self, user_id: int, data: dict[str, Any]) -> int:
     unknown = set(data) - _UPDATABLE_COLUMNS
     if unknown:
-        raise AppHttpException("Campos no permitidos", 422, {"fields": sorted(unknown)}, code="invalid_fields")
+        # Error de programación (el schema no debería permitirlo): los models no conocen la capa HTTP
+        raise ValueError(f"Columnas no actualizables: {sorted(unknown)}")
     set_clause = ", ".join(f"{col} = :{col}" for col in data)  # col ∈ whitelist
     result = await self.db.execute(f"UPDATE users SET {set_clause} WHERE id = :id", {**data, "id": user_id})
     return result.rowcount
@@ -182,47 +185,7 @@ Las consultas que terminan en una respuesta seleccionan columnas explícitas (ve
 
 ## 3. Estructura MVC e inyección
 
-```python
-# app/models/post_model.py
-class PostModel:
-    def __init__(self, db: Database):
-        self.db = db
-
-    async def find_by_id(self, post_id: int) -> dict | None:
-        return await self.db.fetch_one("SELECT id, title FROM posts WHERE id = :id", {"id": post_id})
-
-def get_post_model(db: DatabaseDep) -> PostModel:
-    return PostModel(db)
-
-PostModelDep = Annotated[PostModel, Depends(get_post_model)]
-```
-
-```python
-# app/controllers/post_controller.py
-class PostController:
-    def __init__(self, posts: PostModel):
-        self.posts = posts
-
-    async def get_post(self, post_id: int) -> dict:
-        post = await self.posts.find_by_id(post_id)
-        if not post:
-            raise AppHttpException("Post no encontrado", 404, {"post_id": post_id}, code="post_not_found")
-        return post
-
-def get_post_controller(posts: PostModelDep) -> PostController:
-    return PostController(posts)
-
-PostControllerDep = Annotated[PostController, Depends(get_post_controller)]
-```
-
-```python
-# app/routes/v1/posts.py
-@router.get("/{post_id}", response_model=ApiResponse[PostOut])
-async def get_post(post_id: int, posts: PostControllerDep):
-    return success(data=await posts.get_post(post_id))
-```
-
-Registrar el router en `build_v1_router()` (`app/routes/v1/routes.py`). Sin lógica de negocio en las routes ni SQL en los controllers.
+La receta completa (tabla, model, controller, schemas, route, test) está en [new-feature.md](new-feature.md) y las reglas de capas en [architecture.md](architecture.md). La idea de fondo: cada capa tiene un solo motivo para cambiar, y todo se inyecta con `Depends` para poder reemplazarlo en tests con `dependency_overrides`.
 
 ---
 
@@ -233,13 +196,13 @@ Registrar el router en `build_v1_router()` (`app/routes/v1/routes.py`). Sin lóg
 ```python
 # ✅
 @router.get("/{user_id}", response_model=ApiResponse[UserOut])
-async def get_user(user_id: int, users: UserControllerDep):
+async def get_user(user_id: EncodedId, users: UserControllerDep):   # llega como int ya decodificado
     return success(data=await users.get_user(user_id))
 
 # ❌ Rompe el formato estándar
 @router.get("/{user_id}")
-async def get_user(user_id: int):
-    return {"id": 1}
+async def get_user(user_id: EncodedId):
+    return {"id": user_id}
 ```
 
 ### Siempre `AppHttpException`
@@ -294,23 +257,13 @@ class UserCreate(BaseModel):
 
 En updates parciales usar `payload.model_dump(exclude_unset=True)`.
 
-Estilo FastAPI/Pydantic moderno: `Field(min_length=...)` sin `...`; parámetros con `Annotated` en vez de defaults (`is_active: Annotated[bool | None, Query()] = None`, `file: Annotated[UploadFile, File()]`, `PaginationDep`, `UserControllerDep`); `status_code=status.HTTP_201_CREATED` en vez de `201`.
+Estilo FastAPI/Pydantic moderno: `Field(min_length=...)` sin `...`; parámetros con `Annotated` en vez de defaults (`is_active: Annotated[bool | None, Query()] = None`, `file: Annotated[UploadFile, File()]`, `query: Annotated[UserListQuery, Query()]`, `UserControllerDep`); `status_code=status.HTTP_201_CREATED` en vez de `201`.
 
 ---
 
 ## 6. Rate Limiting
 
-```python
-from app.core.environment import settings
-from app.core.rate_limit import rate_limit
-
-@router.post("/login", dependencies=[rate_limit(settings.RATE_LIMIT_LOGIN)])  # leído al importar
-async def login(...): ...
-```
-
-El límite global por IP lo aplica nginx (`limit_req`); en la app solo se limitan rutas concretas. Con más de un worker o réplica, usar Redis (`RATE_LIMIT_REDIS_ENABLED=True`, `uv sync --extra redis`): en memoria cada worker cuenta por separado.
-
-El rate limit de la app es una dependencia y FastAPI la resuelve **después** de leer el body: no frena bodies grandes. El límite duro es `limit_req` de nginx (+ `RequestSizeMiddleware`).
+Por qué dos niveles: nginx (`limit_req`) frena el abuso por IP antes de llegar a Python; la app solo limita rutas concretas (login, endpoints costosos). El límite de la app es una dependencia y FastAPI la resuelve **después** de leer el body, así que no frena bodies grandes. Reglas y uso en [api-conventions.md](api-conventions.md); detalle en [rate-limiting](../features/rate-limiting.md).
 
 ---
 
@@ -338,17 +291,14 @@ logger.warning("Proveedor lento: %.1fs", elapsed)
 - Contraseñas cifradas de forma reversible (`encrypt_password()` / `verify_password()` / `reveal_password()` de `app/utils/passwords.py`) con `ENCRYPTION_KEYS`; la llave se guarda y respalda fuera de la BD. Ver [security](../features/security.md).
 - Un secreto por propósito: `SECRET_KEY`, `ENCRYPTION_KEYS`, `ENCODING_ALPHABET`, `DB_PASS` (en producción deben ser distintos).
 - IDs públicos con `EncodedId`/`EncodedIdOut` (ofuscación, no autorización).
-- En producción la app no arranca con `SECRET_KEY` < 32 caracteres, `DB_PASS` débil, `CORS_ORIGINS=*` o `ENCODING_ALPHABET` por defecto; en staging y producción, tampoco sin `ENCRYPTION_KEYS` o con `DOCS_PASSWORD` débil (docs protegidos). `SECRET_KEY` está reservado para la auth del proyecto.
+- La app no arranca con configuración insegura en producción: lista completa de validaciones en [configuration.md](configuration.md).
 - Uploads: `save_upload()` valida tipo y tamaño mientras copia; el MIME lo declara el cliente, validar el contenido si es crítico. Eliminar siempre el temporal en `finally`.
 
 ---
 
 ## 9. Testing
 
-```bash
-docker compose -f docker-compose.test.yml up -d --wait
-uv run pytest
-```
+Comandos y convenciones en [testing-and-quality.md](testing-and-quality.md).
 
 - Tests contra MariaDB real (no SQLite: SQL directo, SP, `SIGNAL` y collations son específicos de MariaDB/MySQL).
 - Marcar con `pytestmark = pytest.mark.db` los tests que usan BD (se omiten solos si no hay BD).
@@ -361,7 +311,8 @@ uv run pytest
 pytestmark = pytest.mark.db
 
 async def test_get_user_404(client: httpx2.AsyncClient) -> None:
-    response = await client.get("/api/v1/users/999999")
+    # El id va codificado: un int crudo en la URL da 404 sin `code` (EncodedId lo rechaza antes)
+    response = await client.get(f"/api/v1/users/{encode_id(999999)}")
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "user_not_found"
 ```
@@ -372,7 +323,9 @@ async def test_get_user_404(client: httpx2.AsyncClient) -> None:
 
 ```bash
 uv run --with pre-commit pre-commit install
-uv run ruff check . && uv run ruff format --check .
+uv run ruff check . && uv run ruff format --check .   # lint y formato (no verifica tipos)
+uv run pyright                                        # tipos
+uv run pip-audit                                      # vulnerabilidades conocidas en dependencias
 ```
 
 Commits semánticos: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`.

@@ -23,7 +23,7 @@ main.py → create_app()               App raíz (sin docs propios)
 | `LoggerMiddleware` (access log) | Documentación (`/docs`, `/redoc`) |
 | `CORSMiddleware` | `RequestSizeMiddleware` (límite de body) |
 | Handlers de error (`register_exception_handlers`) | Handlers de error (`register_exception_handlers`) |
-| Lifespan: engine BD, cliente HTTP | |
+| Lifespan: verificación de BD; al apagar, cierre de clientes HTTP y pool | |
 | `/health`, `/ready` | |
 
 > **Starlette no ejecuta el lifespan de las sub-apps montadas.** Todo recurso con ciclo de vida (BD, clientes, tareas) se inicia y se cierra en el lifespan de la app raíz.
@@ -113,6 +113,7 @@ Los `dependency_overrides` son **por app**. Las rutas viven en la sub-app, así 
 
 ```python
 from app.controllers.user_controller import get_user_controller
+from app.core.encoding import encode_id
 
 
 async def test_controller_can_be_overridden(client, v1_app):  # v1_app = app.state.versioned_apps["v1"]
@@ -121,7 +122,7 @@ async def test_controller_can_be_overridden(client, v1_app):  # v1_app = app.sta
 
     v1_app.dependency_overrides[get_user_controller] = FakeController
     try:
-        resp = await client.get("/api/v1/users/99")
+        resp = await client.get(f"/api/v1/users/{encode_id(99)}")   # un int crudo daría 404 antes del controller
     finally:
         v1_app.dependency_overrides.clear()
 ```

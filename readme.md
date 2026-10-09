@@ -6,19 +6,21 @@
 
 | Categoría | Funcionalidad |
 |---|---|
-| **Arquitectura** | Routes → Controllers → Models → Database, inyección con `Depends`, API versionada por sub-apps |
-| **Async** | SQLAlchemy 2.1 async + `asyncmy`, cliente `httpx` compartido, uploads con `anyio`, trabajo de CPU en threads |
+| **Arquitectura** | Routes → Controllers → (Services) → Models → Database, inyección con `Depends`, API versionada por sub-apps |
+| **Async** | SQLAlchemy 2.1 async (solo engine/pool) + `asyncmy`, un pool `httpx` por servicio externo (`ServiceClient`), uploads con `anyio`, trabajo de CPU en threads |
 | **Base de datos** | MariaDB / MySQL. SQL directo con `Database` (`fetch_one`, `fetch_all`, `execute`, `transaction`, `call_procedure`) |
 | **Esquema** | SQL plano en `database/` (`init/NNN_*.sql` en orden + `procedures/`), sin ORM ni Alembic (Alembic opcional: `uv add alembic`, ver `database/README.md`). `001_users.sql` crea la tabla `users` |
 | **Configuración** | `pydantic-settings` tipado y validado al arrancar (`app/core/environment.py` → `settings.DB_HOST`). `APP_ENV` obligatorio |
 | **Respuestas** | Envelope `ApiResponse[T]` con `success()`, `paginated()`, `empty()` |
+| **Listados** | Contrato único: `page`/`size`, `sort=-campo`, filtros (`_from`/`_to`, `_min`/`_max`, `q`, IN) y 422 ante parámetros desconocidos (`ListQuery` + `WhereBuilder`) |
 | **Errores** | `AppHttpException` + handlers globales con un único formato `{"detail": {...}}` y `request_id` |
 | **Rate limiting** | Global por IP en nginx (`limit_req`) + dependencia `rate_limit()` por ruta (librería `limits`); memoria o Redis |
 | **Middlewares** | ASGI puros: Context (Request ID), Logger, CORS, Request Size |
 | **Observabilidad** | Logs text/JSON con Request ID, OpenTelemetry nativo de FastAPI |
 | **Health** | `/health` (liveness) y `/ready` (readiness, 503 si la BD no responde) |
-| **Calidad** | Tests con pytest contra MariaDB real, Ruff (incluye reglas `ASYNC`), pre-commit |
-| **Despliegue** | Dockerfile multi-stage sin privilegios, compose con MariaDB (esquema inicial desde `database/init/`) + Nginx |
+| **Seguridad** | Cifrado con rotación de llaves (`ENCRYPTION_KEYS`), IDs públicos codificados (sqids), validación de configuración insegura al arrancar |
+| **Calidad** | Tests con pytest contra MariaDB real, cobertura (`pytest-cov`), Ruff (incluye reglas `ASYNC`), pyright, pip-audit, pre-commit |
+| **Despliegue** | Dockerfile multi-stage sin privilegios, compose con MariaDB (arranca vacía; el esquema de `database/` se aplica a mano) + Nginx |
 
 ---
 
@@ -67,25 +69,28 @@ Todas las variables se declaran en `app/core/environment.py` (`from app.core.env
 | Variable | Descripción |
 |---|---|
 | `APP_ENV` | **Obligatoria**: `development` \| `test` \| `staging` \| `production` |
+| `APP_NAME` | Nombre de la app (título en los docs) |
 | `SECRET_KEY` | Reservado para la auth del proyecto. En producción, mínimo 32 caracteres (la app no arranca si no) |
-| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME` | Conexión MariaDB/MySQL |
-| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE`, `DB_STATEMENT_TIMEOUT` | Pool y timeouts |
+| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME`, `DB_COLLATION` | Conexión MariaDB/MySQL |
+| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE`, `DB_CONNECT_TIMEOUT`, `DB_STATEMENT_TIMEOUT` | Pool y timeouts |
+| `ENCRYPTION_KEYS` | Llaves de cifrado (la primera cifra, todas descifran). Obligatoria en staging y producción |
+| `ENCODING_ALPHABET`, `ENCODING_MIN_LENGTH` | Encoding de IDs públicos. Alfabeto propio y fijo por proyecto (el default falla en producción) |
 | `DOCS_ENABLED`, `DOCS_PASSWORD_ENABLED`, `DOCS_USER`, `DOCS_PASSWORD` | Docs (vacío = habilitadas fuera de producción) |
 | `RATE_LIMIT_ENABLED`, `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REDIS_ENABLED`, `RATE_LIMIT_REDIS_URL` | Rate limiting |
-| `CORS_ORIGINS` | Orígenes separados por coma. Vacío = CORS deshabilitado. `*` prohibido en producción |
+| `CORS_ORIGINS`, `CORS_ALLOW_CREDENTIALS` | Orígenes separados por coma. Vacío = CORS deshabilitado. `*` prohibido en producción |
 | `LOGGER_LEVEL`, `LOG_FORMAT`, `LOGGER_MIDDLEWARE_*`, `LOGGER_EXCEPTIONS_ENABLED` | Logging |
 | `REQUEST_MAX_SIZE_MB`, `PAGINATION_MAX_SIZE`, `UPLOAD_DIR` | Límites y uploads |
 | `HTTP_CLIENT_*`, `OTEL_ENABLED` | Cliente HTTP y observabilidad |
 | `WORKERS` | Workers de uvicorn (lo usa el entrypoint de Docker) |
 | `ENV_FILE` | Archivo `.env` a leer (default `.env` de la raíz; vacío = ninguno, como en los tests) |
 
-En producción la configuración se valida al arrancar y falla rápido ante valores inseguros (`SECRET_KEY` corto, `DB_PASS` vacío o débil, `CORS_ORIGINS=*`). `DOCS_PASSWORD` débil (con docs protegidos) también falla en staging.
+La configuración se valida al arrancar y falla rápido ante valores inseguros en staging y producción. Lista completa de validaciones y cómo agregar una variable: [docs/development/configuration.md](docs/development/configuration.md).
 
 ---
 
 ## Estructura
 
-`app/` (core, models, controllers, routes, schemas, exceptions, middleware, utils), `database/` (esquema SQL), `tests/` y `docker/`. Árbol completo y responsabilidades por archivo: [docs/project-structure.md](docs/project-structure.md).
+`app/` (core, models, controllers, services, routes, schemas, exceptions, middleware, utils), `database/` (esquema SQL), `tests/` y `docker/`. Árbol completo y responsabilidades por archivo: [docs/project-structure.md](docs/project-structure.md).
 
 ---
 
@@ -101,7 +106,7 @@ main.py (app raíz: lifespan, Context/Logger/CORS, handlers de error)
     └── /test/...             ← solo fuera de producción
 ```
 
-El lifespan de la app raíz inicia y cierra el cliente HTTP y el pool de la BD (Starlette no ejecuta el lifespan de sub-apps montadas).
+El lifespan de la app raíz verifica la BD al arrancar y, al apagar, cierra los clientes HTTP (`close_all`) y el pool de la BD; los clientes HTTP se crean en el primer uso. Starlette no ejecuta el lifespan de sub-apps montadas.
 
 ### Agregar v2
 
@@ -116,90 +121,21 @@ app.mount("/api/v2", v2)
 
 ## Patrones de Uso
 
-### Endpoint completo (Routes → Controllers → Models)
+| Necesito… | Cómo | Guía |
+|---|---|---|
+| Crear una feature (tabla → route → test) | Receta paso a paso con el ejemplo `users` | [new-feature.md](docs/development/new-feature.md) |
+| Diseñar un endpoint | Contrato: path, query, body, filtros, fechas, orden, status | [api-contract.md](docs/development/api-contract.md) |
+| Listar con filtros y orden | Modelo que hereda de `ListQuery` + `WhereBuilder`/`order_by` en el model | [pagination](docs/features/pagination.md) |
+| Responder | `ApiResponse[T]` con `success()`, `paginated()`, `empty()` | [response-format](docs/features/response-format.md) |
+| Lanzar un error | `AppHttpException(msg, status, context, code=...)` → `{"detail": {...}}` | [exceptions](docs/features/exceptions.md) |
+| Consultar la BD | `await db.fetch_one/fetch_all/execute`, SQL directo con parámetros | [data-access.md](docs/development/data-access.md) |
+| Llamar una API externa | Un service que hereda de `ServiceClient` | [external-services.md](docs/development/external-services.md) |
+| Limitar una ruta | `dependencies=[rate_limit("5/minute")]` → 429 con `Retry-After` | [rate-limiting](docs/features/rate-limiting.md) |
+| Cifrar datos o exponer IDs | `encrypt()`/`decrypt()`, `EncodedId`/`EncodedIdOut` | [security](docs/features/security.md) |
+| Trabajo de CPU o librerías síncronas | `await anyio.to_thread.run_sync(func, ...)` | [best-practices](docs/development/best-practices.md) |
 
-```python
-# app/routes/v1/users.py
-@router.get("/{user_id}", response_model=ApiResponse[UserOut])
-async def get_user(user_id: int, users: UserControllerDep):
-    return success(data=await users.get_user(user_id))
-
-
-@router.get("", response_model=ApiResponse[list[UserOut]])
-async def list_users(users: UserControllerDep, pagination: PaginationDep):
-    items, total = await users.list_users(pagination)
-    return paginated(items, total=total, pagination=pagination)
-```
-
-```python
-# app/models/user_model.py
-class UserModel:
-    def __init__(self, db: Database):
-        self.db = db
-
-    async def find_by_id(self, user_id: int) -> dict | None:
-        return await self.db.fetch_one(
-            "SELECT id, username, email FROM users WHERE id = :id", {"id": user_id}
-        )
-```
-
-### Respuestas
-
-```json
-{"data": {"id": 1, "username": "john"}}
-{"data": [...], "pagination": {"page": 1, "size": 20, "total": 150, "pages": 8, "has_next": true, "has_prev": false}}
-{"message": "Usuario eliminado exitosamente"}
-```
-
-### Errores
-
-```python
-from app.exceptions import AppHttpException
-
-raise AppHttpException("Usuario no encontrado", 404, {"user_id": user_id}, code="user_not_found")
-```
-
-```json
-{"detail": {"msg": "Usuario no encontrado", "type": "NotFound", "code": "user_not_found", "request_id": "..."}}
-```
-
-`context` solo se incluye en `APP_ENV=development`; `loc` (archivo/función/línea) solo en los 500 no controlados, también solo en development. Los errores de BD se traducen solos: duplicado → 409, pool agotado → 503, timeout de sentencia → 504.
-
-### Rate limiting por ruta
-
-```python
-from app.core.rate_limit import rate_limit
-
-@router.post("/login", dependencies=[rate_limit("5/minute")])
-async def login(...): ...
-```
-
-Responde 429 con header `Retry-After`. El límite global por IP lo aplica nginx (`limit_req`).
-
-### Servicios externos
-
-Cada API externa es un service que hereda de `ServiceClient` (pool propio, timeouts, reintentos seguros,
-`X-Request-ID` y errores traducidos a 502/503/504):
-
-```python
-class PaymentsService(ServiceClient):
-    name = "payments"
-    base_url = "https://api.payments.example/v1"
-
-    async def get_order(self, order_id: str) -> dict:
-        return await self.get_json(f"/orders/{order_id}")
-
-PaymentsServiceDep = Annotated[PaymentsService, Depends(PaymentsService.instance)]
-```
-
-Ejemplo completo: `app/services/httpbin_service.py`. Guía: [docs/features/services.md](docs/features/services.md).
-
-### Seguridad
-
-Cifrado reversible con rotación de llaves (`app/core/encryption.py`, `ENCRYPTION_KEYS`), contraseñas cifradas
-(auditables) y encoding de IDs públicos (`app/core/encoding.py`, sqids): [docs/features/security.md](docs/features/security.md).
-
-Trabajo de CPU o librerías síncronas: `await anyio.to_thread.run_sync(func, ...)`. Reglas completas en [docs/development/best-practices.md](docs/development/best-practices.md).
+Reglas de programación completas: [docs/development/](docs/development/README.md). Ejemplo de referencia: `users`
+(`app/models/user_model.py`, `app/controllers/user_controller.py`, `app/routes/v1/users.py`).
 
 ---
 
@@ -210,8 +146,10 @@ docker compose -f docker-compose.test.yml up -d --wait   # MariaDB de test (puer
 uv run pytest                                            # tests con BD se omiten si no hay MariaDB
 docker compose -f docker-compose.test.yml down
 
-uv run ruff check .
-uv run ruff format .
+uv run ruff check . && uv run ruff format --check .      # lint y formato (sin reescribir)
+uv run pyright                                           # tipos (Ruff no verifica tipos)
+uv run pytest --cov                                      # cobertura de app/ (se mide, sin umbral)
+uv run pip-audit                                         # vulnerabilidades en dependencias
 
 uv run --with pre-commit pre-commit install              # ruff + detect-secrets en cada commit
 ```
@@ -251,12 +189,13 @@ mariadb -h <host> -u <user> -p <db> < database/init/002_descripcion.sql
 
 ## Documentación
 
-- [Inicio Rápido](docs/getting-started.md)
+- [Inicio Rápido](docs/getting-started.md) · [Iniciar un proyecto desde la plantilla](docs/development/starting-new-project.md)
 - [Estructura del Proyecto](docs/project-structure.md)
-- [Mejores Prácticas (async)](docs/development/best-practices.md)
+- [Reglas de programación](docs/development/README.md) · [Mejores Prácticas (async)](docs/development/best-practices.md)
+- [Guía para agentes de IA](AGENTS.md)
 - [API Versionada](docs/features/api-versioning.md)
 - [Respuestas Estándar](docs/features/response-format.md)
-- [Paginación](docs/features/pagination.md)
+- [Contrato de la API](docs/development/api-contract.md) · [Paginación, filtros y orden](docs/features/pagination.md)
 - [File Upload](docs/features/file-upload.md)
 - [Rate Limiting](docs/features/rate-limiting.md)
 - [CORS](docs/features/cors.md)
@@ -265,6 +204,8 @@ mariadb -h <host> -u <user> -p <db> < database/init/002_descripcion.sql
 - [Logging](docs/features/logging.md)
 - [Excepciones](docs/features/exceptions.md)
 - [Base de Datos](docs/features/database.md)
+- [Servicios externos](docs/features/services.md)
+- [Seguridad](docs/features/security.md)
 - [Esquema de BD](database/README.md)
 - [Despliegue](docs/deployment.md) · [Docker](docs/docker-deployment.md)
 
@@ -275,4 +216,6 @@ mariadb -h <host> -u <user> -p <db> < database/init/002_descripcion.sql
 - **[Pydantic v2](https://docs.pydantic.dev/)** + **pydantic-settings**
 - **[limits](https://limits.readthedocs.io/)** — rate limiting async
 - **[httpx](https://www.python-httpx.org/)** — cliente HTTP async
-- **[uv](https://docs.astral.sh/uv/)** y **[Ruff](https://docs.astral.sh/ruff/)**
+- **[cryptography](https://cryptography.io/)** (Fernet) y **[sqids](https://sqids.org/)** — cifrado e IDs públicos
+- **[uv](https://docs.astral.sh/uv/)**, **[Ruff](https://docs.astral.sh/ruff/)** y **[pyright](https://microsoft.github.io/pyright/)**
+- **[pytest](https://docs.pytest.org/)** + pytest-asyncio, pytest-cov y **[pip-audit](https://pypi.org/project/pip-audit/)**

@@ -83,7 +83,7 @@ En memoria, cada worker cuenta por separado (el límite efectivo se multiplica).
 
 El esquema es SQL plano en `database/` (no se usa ORM ni Alembic) y la API **no** lo modifica al arrancar:
 
-- Instalación nueva: aplicar `database/init/*.sql` en orden. Con Docker Compose, MariaDB los ejecuta solo al crear el volumen vacío.
+- Instalación nueva: aplicar `database/init/*.sql` en orden. Con Docker Compose la base también arranca vacía: el compose no ejecuta scripts de esquema.
 - Cambios posteriores: un script nuevo numerado (`002_add_posts.sql`...) aplicado **una vez** por despliegue, antes de levantar la nueva versión, a mano o por el DBA:
 
   ```bash
@@ -141,7 +141,8 @@ FLUSH PRIVILEGES;
 ```
 
 ```bash
-for f in database/init/*.sql; do mariadb -u app -p app < "$f"; done    # esquema inicial, en orden
+for f in database/init/*.sql; do mariadb -u app -p app < "$f"; done        # esquema inicial, en orden
+for f in database/procedures/*.sql; do mariadb -u app -p app < "$f"; done  # stored procedures
 ```
 
 ### Servicio

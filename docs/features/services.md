@@ -17,7 +17,8 @@ routes ──► controllers ──┬──► services (negocio) ──► mod
 
 **Prohibido en un service**: `Request`/`Response`/`UploadFile`, importar controllers o routes, SQL directo
 (va en models), crear `httpx.AsyncClient` propio, devolver `httpx.Response` (devolver `dict`, `list` o un
-schema). `tests/test_architecture.py` lo verifica.
+schema). `tests/test_architecture.py` verifica una parte: que un service no importe controllers/routes ni use
+`sqlalchemy`, y que `httpx.AsyncClient(` solo se cree en `core/http_client.py`. El resto es revisión de código.
 
 ---
 
@@ -121,7 +122,7 @@ def get_order_controller(orders: OrderModelDep, payments: PaymentsServiceDep) ->
 | Pool del servicio lleno | 503 | `external_service_unavailable` / `pool_exhausted` |
 | No conecta / conexión cortada | 503 | `external_service_unavailable` / `connection_error` |
 | Timeout | 504 | `external_service_timeout` / `timeout` |
-| Proveedor 429 o 503 | 503 (+ su `Retry-After`) | `external_service_unavailable` / `upstream_429` |
+| Proveedor 429 o 503 | 503 (+ su `Retry-After`) | `external_service_unavailable` / `upstream_429` o `upstream_503` |
 | Proveedor 401/403 | **502** | `external_service_error` / `upstream_auth` |
 | Otro 4xx/5xx, redirect | 502 | `external_service_error` / `upstream_<status>` |
 | JSON inválido | 502 | `external_service_error` / `invalid_json` |

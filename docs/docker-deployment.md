@@ -98,7 +98,7 @@ Opcionales relevantes: `WORKERS`, `RATE_LIMIT_REDIS_ENABLED` / `RATE_LIMIT_REDIS
 docker compose up -d --build
 docker compose ps
 docker compose logs -f api
-docker compose logs db           # primer arranque: ejecución de database/init/*.sql
+docker compose logs db           # arranque y errores de MariaDB
 ```
 
 ## 3. Verificar
@@ -225,7 +225,7 @@ La API está viva pero no alcanza la BD: `docker compose logs db`, revisar `DB_*
 
 ### `Table '...' doesn't exist`
 
-El volumen `mariadb_data` ya existía, así que `database/init/` no se ejecutó (o falta un script nuevo). Aplicar el script a mano (ver Operación) o, solo en local, `docker compose down -v` para recrear el volumen.
+El compose no ejecuta scripts de esquema: la base arranca vacía. Falta aplicar `database/init/*.sql` y `database/procedures/*.sql` (o un script nuevo) a mano; ver [Operación](#operación).
 
 ### Nginx devuelve 502
 

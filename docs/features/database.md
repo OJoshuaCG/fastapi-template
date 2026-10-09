@@ -118,51 +118,18 @@ Si tienes que interpolar nombres de columna (por ejemplo en un `UPDATE` dinámic
 
 ## Patrón Model → Controller → Route
 
-Los models reciben `Database` por constructor y exponen métodos async que retornan dicts. Se inyectan con `Depends`, así que en tests se pueden reemplazar.
+Los models reciben `Database` por constructor y exponen métodos async que retornan dicts. Se inyectan con `Depends`,
+así que en tests se pueden reemplazar. La receta completa (tabla, model, controller, schemas, route, test) está en
+[new-feature.md](../development/new-feature.md); el ejemplo real es `app/models/user_model.py`,
+`app/controllers/user_controller.py` y `app/routes/v1/users.py`.
+
+Un método que deba participar en una transacción del controller recibe la conexión como argumento opcional:
 
 ```python
-# app/models/post_model.py
-from typing import Annotated, Any
-
-from fastapi import Depends
-from sqlalchemy.ext.asyncio import AsyncConnection
-
-from app.core.database import Database, DatabaseDep
-
-
-class PostModel:
-    def __init__(self, db: Database):
-        self.db = db
-
-    async def find_by_id(self, post_id: int) -> dict | None:
-        return await self.db.fetch_one("SELECT * FROM posts WHERE id = :id", {"id": post_id})
-
-    async def find_all(self, *, limit: int, offset: int) -> list[dict]:
-        return await self.db.fetch_all(
-            "SELECT * FROM posts ORDER BY id DESC LIMIT :limit OFFSET :offset",
-            {"limit": limit, "offset": offset},
-        )
-
-    async def count(self) -> int:
-        return int(await self.db.fetch_value("SELECT COUNT(*) FROM posts") or 0)
-
-    async def create(self, data: dict[str, Any], *, conn: AsyncConnection | None = None) -> int:
-        result = await self.db.execute(
-            "INSERT INTO posts (title, content) VALUES (:title, :content)",
-            {"title": data["title"], "content": data.get("content")},
-            conn=conn,
-        )
-        return int(result.lastrowid or 0)
-
-
-def get_post_model(db: DatabaseDep) -> PostModel:
-    return PostModel(db)
-
-
-PostModelDep = Annotated[PostModel, Depends(get_post_model)]
+async def create(self, data: dict[str, Any], *, conn: AsyncConnection | None = None) -> int:
+    result = await self.db.execute("INSERT INTO posts (title) VALUES (:title)", {"title": data["title"]}, conn=conn)
+    return int(result.lastrowid or 0)
 ```
-
-El controller recibe el model de la misma forma (ver `app/controllers/user_controller.py`) y la route recibe el controller con `UserControllerDep`/`PostControllerDep`. El ejemplo completo está en `app/models/user_model.py`, `app/controllers/user_controller.py` y `app/routes/v1/users.py`.
 
 ## Transacciones
 
@@ -270,6 +237,7 @@ Las `BackgroundTasks` corren **después** de enviar la respuesta. Tienen que abr
 from fastapi import APIRouter, BackgroundTasks
 
 from app.core.database import get_database
+from app.core.encoding import EncodedId
 from app.utils.response import ApiResponse, empty
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -282,7 +250,7 @@ async def recalculate_stats(user_id: int) -> None:
 
 
 @router.post("/{user_id}/recalculate", response_model=ApiResponse[None])
-async def recalculate(user_id: int, background: BackgroundTasks):
+async def recalculate(user_id: EncodedId, background: BackgroundTasks):
     background.add_task(recalculate_stats, user_id)
     return empty("Recalculo en proceso")
 ```

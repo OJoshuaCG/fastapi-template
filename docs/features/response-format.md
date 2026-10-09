@@ -24,16 +24,18 @@ Solo los campos de **primer nivel** con valor `None` se excluyen del JSON (`Fiel
 ## Ejemplos
 
 ```python
-from fastapi import status
+from typing import Annotated
+
+from fastapi import Query, status
 
 from app.controllers.user_controller import UserControllerDep
-from app.schemas.user import UserCreate, UserOut
-from app.utils.pagination import PaginationDep
+from app.core.encoding import EncodedId
+from app.schemas.user import UserCreate, UserListQuery, UserOut
 from app.utils.response import ApiResponse, empty, paginated, success
 
 
 @router.get("/{user_id}", response_model=ApiResponse[UserOut])
-async def get_user(user_id: int, users: UserControllerDep):
+async def get_user(user_id: EncodedId, users: UserControllerDep):
     return success(data=await users.get_user(user_id))
 
 
@@ -44,13 +46,13 @@ async def create_user(payload: UserCreate, users: UserControllerDep):
 
 
 @router.get("", response_model=ApiResponse[list[UserOut]])
-async def list_users(pagination: PaginationDep, users: UserControllerDep):
-    items, total = await users.list_users(pagination)
-    return paginated(items, total=total, pagination=pagination)
+async def list_users(query: Annotated[UserListQuery, Query()], users: UserControllerDep):
+    items, total = await users.list_users(query)
+    return paginated(items, total=total, pagination=query)
 
 
 @router.delete("/{user_id}", response_model=ApiResponse[None])
-async def delete_user(user_id: int, users: UserControllerDep):
+async def delete_user(user_id: EncodedId, users: UserControllerDep):
     await users.delete_user(user_id)
     return empty("Usuario eliminado exitosamente")
 ```

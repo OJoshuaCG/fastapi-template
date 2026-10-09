@@ -88,7 +88,8 @@ Ver [Manejo de Excepciones](exceptions.md#logging-de-errores).
 
 | Logger | Qué registra |
 |---|---|
-| `app.lifespan` | Arranque/apagado: cliente HTTP, BD, advertencias de configuración (`startup_warnings`). |
+| `app.lifespan` | Arranque/apagado: verificación de BD, cierre de clientes HTTP y pool, advertencias de configuración (`startup_warnings`). |
+| `app.http_client` | Una línea por intento a un servicio externo (`payments \| GET /orders/1 \| 200 \| 85ms \| intento 1`); WARNING si falla. Sin query string ni bodies. |
 | `app.core.rate_limit` | Warning si el storage del rate limit (Redis) no responde o está mal configurado. |
 | `app.routes.health` | Warning con la causa cuando `/ready` responde 503. |
 | `app.exceptions.HandlerExceptions` | Errores (ver arriba). |

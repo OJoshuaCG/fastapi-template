@@ -61,9 +61,11 @@ Si un proyecto prefiere migraciones versionadas con Alembic en vez de scripts SQ
    uv add alembic
    ```
 
-2. Generar la carpeta con la plantilla async (respeta el `alembic.ini` existente):
+2. Generar la carpeta con la plantilla async (respeta el `alembic.ini` existente). `alembic init` exige un
+   directorio vacío y la plantilla trae `alembic/versions/.gitkeep`, así que primero se borra:
 
    ```bash
+   rm -r alembic
    uv run alembic init -t async alembic
    ```
 

@@ -16,6 +16,7 @@ fastapi-template/
 │   │   ├── encoding.py              # encode_id/decode_id, EncodedId / EncodedIdOut (sqids)
 │   │   ├── logging_config.py        # Logging text/JSON con request_id
 │   │   ├── rate_limit.py            # Dependencia rate_limit() (librería limits)
+│   │   ├── sql_filters.py           # WhereBuilder, order_by(): filtros y orden de listados a SQL
 │   │   ├── environment.py          # Settings (pydantic-settings): todas las variables de entorno → settings
 │   │   └── versioned_app.py         # Factory create_versioned_app()
 │   ├── exceptions/
@@ -48,7 +49,7 @@ fastapi-template/
 │       ├── dict_utils.py            # sanitize() de datos sensibles (logs, contexto de errores)
 │       ├── file_upload.py           # save_upload() / save_uploads() async
 │       ├── http.py                  # client_ip(scope), log_level_for_status(status)
-│       ├── pagination.py            # PaginationParams, PaginationDep
+│       ├── list_query.py            # ListQuery (page/size/sort, extra=forbid), DateFilter, SearchText
 │       ├── passwords.py             # encrypt_password() / verify_password() / reveal_password()
 │       ├── response.py              # ApiResponse[T], success(), paginated(), empty()
 │       └── validation_messages.py   # Mensajes de validación en español (422 y configuración)
@@ -81,8 +82,9 @@ fastapi-template/
 ├── docs/                            # Documentación
 ├── uploads/                         # Temporales de upload (.gitkeep)
 ├── main.py                          # create_app(): lifespan, middlewares, montaje de versiones
-├── pyproject.toml                   # Dependencias, Ruff, pytest (deprecaciones = error)
+├── pyproject.toml                   # Dependencias, Ruff, pyright, cobertura, pytest (deprecaciones = error)
 ├── alembic.ini                      # Opcional: requiere `uv add alembic` (ver database/README.md)
+├── alembic/versions/                # Vacío (.gitkeep); borrar antes de `alembic init` (ver database/README.md)
 ├── uv.lock
 ├── .python-version                  # 3.14
 ├── .env.example                     # Referencia de variables de entorno
@@ -92,7 +94,9 @@ fastapi-template/
 ├── docker-compose.yml               # db, api, nginx
 ├── docker-compose.test.yml          # MariaDB de test (tmpfs, puerto 3307)
 ├── readme.md
-└── CLAUDE.md
+├── AGENTS.md                        # Guía corta para agentes de IA (índice hacia docs/)
+├── CLAUDE.md                        # Solo importa AGENTS.md (@AGENTS.md)
+└── .agents/agents/                  # Definiciones de agentes (ver docs/development/agents.md)
 ```
 
 ---
@@ -120,7 +124,7 @@ DatabaseDep → UserModelDep (get_user_model) → UserControllerDep → endpoint
 ```
 
 Así cualquier capa se reemplaza en tests con `dependency_overrides` (sobre la sub-app, ver abajo).
-Las reglas de qué capa puede importar cuál están en `CLAUDE.md` y las verifica `tests/test_architecture.py`.
+Las reglas de qué capa puede importar cuál están en `docs/development/architecture.md` y las verifica `tests/test_architecture.py`.
 
 ---
 
@@ -128,7 +132,7 @@ Las reglas de qué capa puede importar cuál están en `CLAUDE.md` y las verific
 
 `create_app()` construye la app raíz:
 
-- **Lifespan**: inicia el cliente HTTP y verifica la BD. Cada paso es best-effort (si la BD no responde, la app arranca y `/ready` lo reporta). Al apagar cierra cliente HTTP → pool de la BD.
+- **Lifespan**: registra las advertencias de configuración y verifica la BD. Es best-effort (si la BD no responde, la app arranca y `/ready` lo reporta). Los clientes HTTP se crean en el primer uso; al apagar se cierran (`close_all`) y luego el pool de la BD.
 - **Middlewares transversales** (de afuera hacia adentro): `ContextMiddleware` → `LoggerMiddleware` (si `LOGGER_MIDDLEWARE_ENABLED`) → `CORSMiddleware` (si hay `CORS_ORIGINS`).
 - **Handlers de error** (`register_exception_handlers`) y router de health.
 - **Sub-app v1** montada en `/api/v1`, guardada en `app.state.versioned_apps["v1"]`.
@@ -154,6 +158,7 @@ Starlette **no** ejecuta el lifespan de sub-apps montadas: todo recurso con cicl
 - **`http_client.py`**: `ServiceClient`, base de toda integración externa: un pool httpx por servicio, reintentos solo idempotentes, `translate_http_error()` (503/504/502), `redact_url()`, `close_all()` en el lifespan. Ver [services](features/services.md).
 - **`encryption.py`**: `encrypt()`, `decrypt()`, `rotate()` con MultiFernet (`ENCRYPTION_KEYS`); `fernet_key_from_secret()` para migrar datos de omnicanal. Ver [security](features/security.md).
 - **`encoding.py`**: `encode_id()`, `decode_id()`, `EncodedId` (entrada) y `EncodedIdOut` (salida) con sqids (`ENCODING_ALPHABET`).
+- **`sql_filters.py`**: `WhereBuilder` (igualdad, IN, rangos, búsqueda con LIKE escapado) y `order_by()` con whitelist y desempate por `id`. Lo usan los models para los listados; ver [pagination](features/pagination.md).
 - **`logging_config.py`**: formato text o JSON (`JsonFormatter`), `request_id` en cada línea (`RequestContextFilter`) y `AsgiTracebackFilter` (descarta el traceback duplicado de uvicorn cuando el handler de 500 ya lo registró).
 - **`context.py`**: `current_http_identifier`, `current_request_ip`, `current_request_method`, `current_request_route`, `current_request_host`, `current_request_user_agent`, `current_user_id`. Pensadas para auditoría (quién, desde dónde, en qué ruta); ver [Context](features/context.md).
 
@@ -173,23 +178,14 @@ Starlette **no** ejecuta el lifespan de sub-apps montadas: todo recurso con cicl
 
 ### `app/utils/`
 
-`response.py`, `pagination.py`, `file_upload.py` (copia por bloques con `anyio`, valida tipo y tamaño), `passwords.py` (contraseñas cifradas reversibles sobre `core/encryption.py`), `dict_utils.py` (`sanitize()`, `is_sensitive_key()`), `validation_messages.py` (mensajes de validación en español, usados en los 422 y en los errores de configuración), `http.py` (`client_ip()`, `log_level_for_status()`, usados por middlewares, handlers y rate limit).
+`response.py`, `list_query.py` (query params de listados, ver [pagination](features/pagination.md)), `file_upload.py` (copia por bloques con `anyio`, valida tipo y tamaño), `passwords.py` (contraseñas cifradas reversibles sobre `core/encryption.py`), `dict_utils.py` (`sanitize()`, `is_sensitive_key()`), `validation_messages.py` (mensajes de validación en español, usados en los 422 y en los errores de configuración), `http.py` (`client_ip()`, `log_level_for_status()`, usados por middlewares, handlers y rate limit).
 
 ---
 
 ## Convenciones de Nombres
 
-| Tipo | Archivo | Clase / variable |
-|---|---|---|
-| Tabla | `database/init/00N_posts.sql` | `posts` |
-| Modelo SQL | `app/models/post_model.py` | `PostModel`, `PostModelDep` |
-| Controlador | `app/controllers/post_controller.py` | `PostController`, `PostControllerDep` |
-| Service | `app/services/payments_service.py` | `PaymentsService`, `PaymentsServiceDep` |
-| Routes | `app/routes/v1/posts.py` | `router` |
-| Schemas | `app/schemas/post.py` | `PostCreate`, `PostUpdate`, `PostOut` |
-| Tests | `tests/test_posts_api.py` | `test_*` |
-
-Clases en `PascalCase`, funciones y variables en `snake_case`.
+Tabla completa de nombres (tablas, models, controllers, services, routes, schemas, tests) en
+[development/architecture.md](development/architecture.md#nombres).
 
 ---
 

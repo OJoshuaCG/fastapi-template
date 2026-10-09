@@ -26,7 +26,7 @@ Request
               ServerErrorMiddleware
               RequestSizeMiddleware    límite de body
               ExceptionMiddleware      handlers de la versión
-              Router → dependencias globales (rate limit) → dependencias de ruta → endpoint
+              Router → dependencias de ruta (ej. rate_limit()) → endpoint
 ```
 
 Por eso `/health` y `/ready` llevan request id y CORS, pero no pasan por el límite de body ni por el rate limit, y el access log las excluye.
