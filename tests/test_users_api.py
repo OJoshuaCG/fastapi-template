@@ -5,7 +5,7 @@ import pytest
 from fastapi import FastAPI
 
 from app.controllers.user_controller import get_user_controller
-from app.core.database import get_database
+from app.core.database import Database, get_database
 from app.core.encoding import encode_id
 
 pytestmark = pytest.mark.db
@@ -108,3 +108,70 @@ async def test_invalid_public_id_is_404(client: httpx2.AsyncClient) -> None:
         resp = await client.get(f"/api/v1/users/{raw}")
         assert resp.status_code == 404, raw
         assert resp.json()["detail"]["type"] == "NotFound"
+
+
+async def _insert_users(db: Database) -> None:
+    rows = [
+        ("ana", "ana@example.com", True, "2026-01-10 08:00:00"),
+        ("beto", "beto@example.com", False, "2026-01-15 12:00:00"),
+        ("carla", "carla@test.org", True, "2026-02-01 09:30:00"),
+    ]
+    for username, email, is_active, created_at in rows:
+        await db.execute(
+            "INSERT INTO users (username, email, encrypted_password, is_active, created_at) "
+            "VALUES (:username, :email, 'x', :is_active, :created_at)",
+            {
+                "username": username,
+                "email": email,
+                "is_active": is_active,
+                "created_at": created_at,
+            },
+        )
+
+
+async def test_list_filters_sort_and_search(
+    client: httpx2.AsyncClient, db: Database, clean_users
+) -> None:
+    await _insert_users(db)
+
+    async def usernames(**params: str) -> list[str]:
+        resp = await client.get("/api/v1/users", params=params)
+        assert resp.status_code == 200, resp.text
+        return [user["username"] for user in resp.json()["data"]]
+
+    assert await usernames() == ["carla", "beto", "ana"]  # default: -created_at
+    assert await usernames(sort="username") == ["ana", "beto", "carla"]
+    assert await usernames(sort="-email") == ["carla", "beto", "ana"]
+    # Solo fecha en _to: incluye el día completo (beto se creó a las 12:00)
+    assert await usernames(created_at_from="2026-01-15", created_at_to="2026-01-15") == ["beto"]
+    assert await usernames(created_at_to="2026-01-15T11:59:59") == ["ana"]
+    assert await usernames(created_at_from="2026-01-11", sort="username") == ["beto", "carla"]
+    assert await usernames(q="example.com", sort="username") == ["ana", "beto"]
+    assert await usernames(q="100%") == []  # el % se busca literal, no como comodín
+    assert await usernames(is_active="false") == ["beto"]
+
+    filtered = await client.get("/api/v1/users", params={"is_active": "true", "size": 1})
+    assert filtered.json()["pagination"]["total"] == 2  # el count usa los mismos filtros
+
+
+@pytest.mark.parametrize(
+    ("params", "field", "error_type"),
+    [
+        ({"is_activ": "true"}, "is_activ", "extra_forbidden"),
+        ({"sort": "encrypted_password"}, "sort", "invalid_sort"),
+        (
+            {"created_at_from": "2026-02-01", "created_at_to": "2026-01-01"},
+            "created_at_to",
+            "invalid_range",
+        ),
+        ({"created_at_from": "2026-01-01T00:00:00Z"}, "created_at_from", "date_filter_timezone"),
+        ({"q": "a"}, "q", "string_too_short"),
+    ],
+)
+async def test_list_rejects_params_outside_the_contract(
+    client: httpx2.AsyncClient, params: dict, field: str, error_type: str
+) -> None:
+    resp = await client.get("/api/v1/users", params=params)
+    assert resp.status_code == 422
+    errors = resp.json()["detail"]["errors"]
+    assert [(e["field"], e["type"]) for e in errors] == [(field, error_type)]

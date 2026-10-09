@@ -14,9 +14,8 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.exceptions import AppHttpException
-from app.models.user_model import UserModel, UserModelDep
-from app.schemas.user import UserCreate, UserUpdate
-from app.utils.pagination import PaginationParams
+from app.models.user_model import UserFilters, UserModel, UserModelDep
+from app.schemas.user import UserCreate, UserListQuery, UserUpdate
 from app.utils.passwords import encrypt_password
 
 
@@ -32,15 +31,19 @@ class UserController:
             )
         return user
 
-    async def list_users(
-        self, pagination: PaginationParams, *, is_active: bool | None = None
-    ) -> tuple[list[dict], int]:
+    async def list_users(self, query: UserListQuery) -> tuple[list[dict], int]:
+        filters = UserFilters(
+            is_active=query.is_active,
+            created_at_from=query.created_at_from,
+            created_at_to=query.created_at_to,
+            q=query.q,
+        )
         # Dos consultas secuenciales: cada una toma y devuelve su conexión al pool.
         # No usar asyncio.gather sobre la misma conexión/transacción.
         items = await self.users.find_all(
-            limit=pagination.size, offset=pagination.offset, is_active=is_active
+            limit=query.size, offset=query.offset, filters=filters, sort=query.sort_terms
         )
-        total = await self.users.count(is_active=is_active)
+        total = await self.users.count(filters=filters)
         return items, total
 
     async def create_user(self, payload: UserCreate) -> dict:

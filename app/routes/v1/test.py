@@ -6,7 +6,7 @@ import asyncio
 from typing import Annotated
 
 import anyio
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.core.environment import settings
@@ -14,7 +14,7 @@ from app.core.rate_limit import rate_limit
 from app.exceptions import AppHttpException
 from app.services.httpbin_service import HttpbinServiceDep
 from app.utils.file_upload import save_upload, save_uploads
-from app.utils.pagination import PaginationDep
+from app.utils.list_query import ListQuery
 from app.utils.response import ApiResponse, empty, paginated, success
 
 router = APIRouter(tags=["test"], prefix="/test")
@@ -30,10 +30,11 @@ async def ping():
 
 
 @router.get("/paginated", response_model=ApiResponse[list[dict]])
-async def paginated_example(pagination: PaginationDep):
+async def paginated_example(query: Annotated[ListQuery, Query()]):
+    # Listado sin filtros: ListQuery directo (page/size; parámetros desconocidos → 422)
     items = [{"id": i, "name": f"Item {i}"} for i in range(1, 51)]
-    page = items[pagination.offset : pagination.offset + pagination.size]
-    return paginated(page, total=len(items), pagination=pagination)
+    page = items[query.offset : query.offset + query.size]
+    return paginated(page, total=len(items), pagination=query)
 
 
 @router.delete("/resource/{resource_id}", response_model=ApiResponse[None])

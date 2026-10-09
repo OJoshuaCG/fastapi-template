@@ -46,3 +46,12 @@ DROP TABLE t;
     assert statements[0] == "CREATE TABLE t (id INT)"
     assert statements[1].startswith("CREATE PROCEDURE p()") and "SELECT 2;" in statements[1]
     assert statements[2] == "DROP TABLE t"
+
+
+def test_users_list_documents_contract_params(app: FastAPI) -> None:
+    schema = app.state.versioned_apps["v1"].openapi()
+    params = {p["name"]: p for p in schema["paths"]["/users"]["get"]["parameters"]}
+    expected = {"page", "size", "sort", "is_active", "created_at_from", "created_at_to", "q"}
+    assert expected <= set(params)
+    # La whitelist de ?sort= se documenta sola desde UserListQuery.sortable_fields
+    assert "created_at, username, email" in params["sort"]["description"]

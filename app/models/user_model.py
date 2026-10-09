@@ -4,12 +4,16 @@ UserModel: acceso a la tabla `users` con SQL directo (async).
 Patrón: Routes → Controllers → Models → Database
 """
 
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Annotated, Any
 
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.core.database import Database, DatabaseDep
+from app.core.sql_filters import SortTerm, WhereBuilder, order_by
 
 # Nunca seleccionar encrypted_password en consultas que terminan en una respuesta
 _PUBLIC_COLUMNS = (
@@ -28,6 +32,20 @@ _INSERT_COLUMNS = (
 _UPDATABLE_COLUMNS = frozenset(
     {"email", "full_name", "notes", "is_active", "is_superuser", "encrypted_password"}
 )
+# Whitelist de ?sort=: nombre público → columna. El valor del cliente nunca llega al SQL
+SORT_COLUMNS = {"created_at": "created_at", "username": "username", "email": "email"}
+# Columnas donde busca ?q=
+_SEARCH_COLUMNS = ("username", "email", "full_name")
+
+
+@dataclass(frozen=True)
+class UserFilters:
+    """Filtros del listado; None = no filtra. Los arma el controller desde UserListQuery."""
+
+    is_active: bool | None = None
+    created_at_from: date | datetime | None = None
+    created_at_to: date | datetime | None = None
+    q: str | None = None
 
 
 class UserModel:
@@ -42,17 +60,23 @@ class UserModel:
         )
 
     async def find_all(
-        self, *, limit: int, offset: int, is_active: bool | None = None
+        self,
+        *,
+        limit: int,
+        offset: int,
+        filters: UserFilters,
+        sort: Sequence[SortTerm] = (),
     ) -> list[dict]:
-        where, params = self._filters(is_active)
+        where, params = self._filters(filters)
+        order = order_by(sort, SORT_COLUMNS, tiebreaker="id")
         return await self.db.fetch_all(
-            f"SELECT {_PUBLIC_COLUMNS} FROM users {where} "  # noqa: S608
-            "ORDER BY id DESC LIMIT :limit OFFSET :offset",
+            f"SELECT {_PUBLIC_COLUMNS} FROM users {where} {order} "  # noqa: S608
+            "LIMIT :limit OFFSET :offset",
             {**params, "limit": limit, "offset": offset},
         )
 
-    async def count(self, *, is_active: bool | None = None) -> int:
-        where, params = self._filters(is_active)
+    async def count(self, *, filters: UserFilters) -> int:
+        where, params = self._filters(filters)
         return int(await self.db.fetch_value(f"SELECT COUNT(*) FROM users {where}", params) or 0)  # noqa: S608
 
     async def create(self, data: dict[str, Any], *, conn: AsyncConnection | None = None) -> int:
@@ -94,10 +118,15 @@ class UserModel:
         return result.rowcount
 
     @staticmethod
-    def _filters(is_active: bool | None) -> tuple[str, dict[str, Any]]:
-        if is_active is None:
-            return "", {}
-        return "WHERE is_active = :is_active", {"is_active": is_active}
+    def _filters(filters: UserFilters) -> tuple[str, dict[str, Any]]:
+        # Un solo WHERE para find_all y count: así `total` coincide con los elementos listados
+        builder = WhereBuilder()
+        builder.equals("is_active", filters.is_active, param="is_active")
+        builder.date_range(
+            "created_at", filters.created_at_from, filters.created_at_to, param="created_at"
+        )
+        builder.contains_text(_SEARCH_COLUMNS, filters.q, param="q")
+        return builder.build()
 
 
 def get_user_model(db: DatabaseDep) -> UserModel:

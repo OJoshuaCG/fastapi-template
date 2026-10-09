@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.utils.pagination import PaginationParams
+from app.utils.list_query import ListQuery
 
 
 def _is_none(value: Any) -> bool:
@@ -41,18 +41,18 @@ class ApiResponse[T](BaseModel):
 
     Uso básico:
         @router.get("/{user_id}", response_model=ApiResponse[UserOut])
-        async def get_user(user_id: int, users: UserControllerDep):
+        async def get_user(user_id: EncodedId, users: UserControllerDep):
             return success(data=await users.get_user(user_id))
 
     Uso paginado:
         @router.get("", response_model=ApiResponse[list[UserOut]])
-        async def list_users(pagination: PaginationDep, users: UserControllerDep):
-            items, total = await users.list_users(pagination)
-            return paginated(items, total=total, pagination=pagination)
+        async def list_users(query: Annotated[UserListQuery, Query()], users: UserControllerDep):
+            items, total = await users.list_users(query)
+            return paginated(items, total=total, pagination=query)
 
     Uso sin contenido (DELETE, operaciones void):
         @router.delete("/{user_id}", response_model=ApiResponse[None])
-        async def delete_user(user_id: int, users: UserControllerDep):
+        async def delete_user(user_id: EncodedId, users: UserControllerDep):
             await users.delete_user(user_id)
             return empty("Usuario eliminado exitosamente")
     """
@@ -89,7 +89,7 @@ def success(data: Any = None, message: str | None = None) -> ApiResponse:
 def paginated(
     data: list[Any],
     total: int,
-    pagination: PaginationParams,
+    pagination: ListQuery,
     message: str | None = None,
 ) -> ApiResponse:
     """
@@ -98,17 +98,16 @@ def paginated(
     Args:
         data:       Lista de elementos de la página actual.
         total:      Total de registros en BD (resultado de COUNT).
-        pagination: Instancia de PaginationParams obtenida via Depends.
+        pagination: Query params del listado (ListQuery o una subclase), recibidos con Query().
         message:    Mensaje opcional para el usuario final.
 
     Ejemplo:
-        from app.utils.pagination import PaginationDep
         from app.utils.response import ApiResponse, paginated
 
         @router.get("/users", response_model=ApiResponse[list[UserOut]])
-        async def list_users(pagination: PaginationDep, users: UserControllerDep):
-            items, total = await users.list_users(pagination)
-            return paginated(items, total=total, pagination=pagination)
+        async def list_users(query: Annotated[UserListQuery, Query()], users: UserControllerDep):
+            items, total = await users.list_users(query)
+            return paginated(items, total=total, pagination=query)
 
     Salida:
         {

@@ -4,6 +4,7 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 from app.core.encoding import EncodedIdOut
+from app.utils.list_query import DateFilter, ListQuery, SearchText
 
 _TEXT_MAX = 65_535  # columna TEXT de MariaDB
 
@@ -35,6 +36,25 @@ class UserUpdate(BaseModel):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} no puede ser null")
         return self
+
+
+class UserListQuery(ListQuery):
+    """Query params de GET /users (contrato: docs/development/api-contract.md)."""
+
+    sortable_fields = ("created_at", "username", "email")
+    default_sort = "-created_at"
+
+    is_active: bool | None = Field(default=None, description="Filtrar por estado")
+    created_at_from: DateFilter | None = Field(
+        default=None, description="Creados desde (inclusive)"
+    )
+    created_at_to: DateFilter | None = Field(
+        default=None,
+        description="Creados hasta (inclusive; con solo fecha incluye el día completo)",
+    )
+    q: SearchText | None = Field(
+        default=None, description="Texto contenido en username, email o nombre completo"
+    )
 
 
 class UserOut(BaseModel):
